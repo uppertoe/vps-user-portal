@@ -1,0 +1,24 @@
+{{template "head" .}}
+<h1>Invite results</h1>
+<div class="notice">
+  <strong>{{.Created}}</strong> of {{.Total}} created.
+  {{if .SendEmail}}A welcome email was sent to each new account.
+  {{else}}No emails were sent — the accounts exist but have no password yet.
+  Ask each person to go to <a href="{{.SSOURL}}">{{.SSOURL}}</a>, click
+  <em>Reset password?</em>, and follow the email, whenever you're ready to onboard them.
+  {{end}}
+</div>
+<div class="table-wrap">
+<table>
+  <tr><th>Email</th><th>Result</th><th>Detail</th></tr>
+  {{range .Results}}
+  <tr>
+    <td>{{.Email}}</td>
+    <td>{{if eq .Status "created"}}<span class="ok">created</span>{{else if eq .Status "skipped"}}<span class="muted">skipped</span>{{else}}<span class="danger">failed</span>{{end}}</td>
+    <td class="muted">{{.Detail}}</td>
+  </tr>
+  {{end}}
+</table>
+</div>
+<p><a href="/invite">Invite more</a> · <a href="/">Back to users</a></p>
+{{template "foot" .}}

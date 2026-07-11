@@ -1,23 +1,21 @@
 {{template "head" .}}
-<h1>Invite a user</h1>
+<h1>Invite users</h1>
 {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-<p class="muted">Creates the account everywhere at once. The user gets an email
-asking them to set their own password — nothing works until they do.</p>
+<p class="muted">Creates the accounts immediately — each person can be assigned in
+Planka straight away, before they've ever logged in. They set their own password
+later (nothing works until they do). No email is sent unless you tick the box.</p>
 <form class="stack" method="post" action="/invite" autocomplete="off">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <label for="email">Email <span class="hint">(allowed: {{range $i, $d := .Domains}}{{if $i}}, {{end}}@{{$d}}{{end}})</span></label>
-  <input type="email" id="email" name="email" required autocomplete="off" spellcheck="false" value="{{.Email}}">
-  <label for="displayname">Display name</label>
-  <input type="text" id="displayname" name="displayname" required autocomplete="off" value="{{.DisplayName}}">
-  <label for="username">Username <span class="hint">(optional — derived from the email if left blank)</span></label>
-  <input type="text" id="username" name="username" autocomplete="off" spellcheck="false" value="{{.Username}}">
-  <label>Access <span class="hint">(what this person can do)</span></label>
+  <label for="users">People <span class="hint">(one per line: <code>email</code> or <code>email, Full Name</code>) — allowed domains: {{range $i, $d := .Domains}}{{if $i}}, {{end}}@{{$d}}{{end}}</span></label>
+  <textarea id="users" name="users" rows="8" required autocomplete="off" spellcheck="false" placeholder="jane.smith@rch.org.au, Dr Jane Smith&#10;bob.jones@rch.org.au">{{.Users}}</textarea>
+  <label>Access <span class="hint">(applied to everyone in this batch)</span></label>
   <div class="checks">
     {{$sel := .Selected}}
     {{range .Groups}}
     <label><input type="checkbox" name="groups" value="{{.Value}}"{{if index $sel .Value}} checked{{end}}> {{.Label}}{{if ne .Label .Value}} <span class="hint">({{.Value}})</span>{{end}}</label>
     {{end}}
   </div>
-  <button type="submit">Create user</button>
+  <label class="toggle"><input type="checkbox" name="send_email"{{if .SendEmail}} checked{{end}}> Also email each person a welcome / password-setup link <span class="hint">(off by default — accounts work without it)</span></label>
+  <button type="submit">Create accounts</button>
 </form>
 {{template "foot" .}}
