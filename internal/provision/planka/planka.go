@@ -16,11 +16,19 @@
 //
 //	GRANT SELECT, INSERT ON user_account TO invite;
 //	GRANT UPDATE (is_deactivated, role) ON user_account TO invite;
+//	GRANT USAGE ON SEQUENCE next_id_seq TO invite;
 //
-// Schema coupling is guarded by Check(): the columns this package writes are
-// asserted against information_schema at startup and periodically, so a
-// Planka major upgrade that moves the furniture fails the portal's
-// healthcheck instead of corrupting writes.
+// The sequence grant is easy to miss but required: user_account.id defaults to
+// next_id(), a plain (non-SECURITY DEFINER) function that calls
+// nextval('next_id_seq'), so the INSERT runs that nextval as the invite role.
+// Without USAGE on the sequence every invite fails with "permission denied for
+// sequence next_id_seq".
+//
+// Both schema coupling AND these grants are guarded by Check(): the columns
+// this package writes are asserted against information_schema, and the role's
+// INSERT/UPDATE/sequence privileges are probed, at startup and periodically —
+// so a Planka major upgrade that moves the furniture, or a missing grant, fails
+// the portal's healthcheck instead of corrupting writes or failing per-invite.
 package planka
 
 import (
@@ -214,6 +222,44 @@ func (p *Provisioner) Check(ctx context.Context) error {
 	}
 	if !passwordExists || !passwordNull {
 		return fmt.Errorf("user_account.password is missing or NOT NULL — SSO-only rows need it nullable")
+	}
+	return p.checkGrants(ctx)
+}
+
+// checkGrants probes that the connection's role actually holds the privileges
+// Provision/Sync need, so a mis-granted role turns /healthz red at startup
+// rather than failing silently on the first invite. Probing (has_*_privilege)
+// consumes nothing — it does not call nextval, so it never burns an id.
+//
+// The sequence grant is the subtle one: id defaults to next_id(), which does
+// nextval('next_id_seq') as the caller, so INSERT needs USAGE on that sequence.
+// If Planka ever renames it, to_regclass returns NULL and we skip the sequence
+// probe (the id-default / insert path then surfaces the real problem) rather
+// than emit a false failure.
+func (p *Provisioner) checkGrants(ctx context.Context) error {
+	var canSelect, canInsert, canDeact, canRole, seqOK bool
+	if err := p.pool.QueryRow(ctx, `
+		SELECT has_table_privilege(current_user, 'user_account', 'SELECT'),
+		       has_table_privilege(current_user, 'user_account', 'INSERT'),
+		       has_column_privilege(current_user, 'user_account', 'is_deactivated', 'UPDATE'),
+		       has_column_privilege(current_user, 'user_account', 'role', 'UPDATE'),
+		       CASE WHEN to_regclass('next_id_seq') IS NULL THEN true
+		            ELSE has_sequence_privilege(current_user, 'next_id_seq', 'USAGE') END`).
+		Scan(&canSelect, &canInsert, &canDeact, &canRole, &seqOK); err != nil {
+		return fmt.Errorf("probe user_account privileges: %w", err)
+	}
+	var missing []string
+	if !canSelect || !canInsert {
+		missing = append(missing, "GRANT SELECT, INSERT ON user_account TO <role>;")
+	}
+	if !canDeact || !canRole {
+		missing = append(missing, "GRANT UPDATE (is_deactivated, role) ON user_account TO <role>;")
+	}
+	if !seqOK {
+		missing = append(missing, "GRANT USAGE ON SEQUENCE next_id_seq TO <role>;")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("the database role is missing grants — run: %s", strings.Join(missing, " "))
 	}
 	return nil
 }
