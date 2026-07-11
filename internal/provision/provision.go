@@ -116,6 +116,7 @@ func Load(path string) ([]Provisioner, error) {
 		return nil, fmt.Errorf("parse provisioners config: %w", err)
 	}
 	var out []Provisioner
+	seen := map[string]bool{}
 	for i, node := range generic.Provisioners {
 		var head struct {
 			Type string `yaml:"type"`
@@ -131,6 +132,13 @@ func Load(path string) ([]Provisioner, error) {
 		if head.Name == "" {
 			head.Name = head.Type
 		}
+		// Names must be unique: they key the per-app status map and label the
+		// UI columns. Running two of the same type (e.g. two Planka instances)
+		// is fully supported — just give each a distinct name.
+		if seen[head.Name] {
+			return nil, fmt.Errorf("duplicate provisioner name %q — give each instance (e.g. two Planka deployments) a unique name", head.Name)
+		}
+		seen[head.Name] = true
 		n := node
 		p, err := f(head.Name, &n)
 		if err != nil {

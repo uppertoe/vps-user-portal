@@ -90,3 +90,68 @@ func TestEmptyPathMeansNoProvisioners(t *testing.T) {
 		t.Errorf("got %v, %v; want none, nil", provs, err)
 	}
 }
+
+// Two Planka instances on one VPS (e.g. planka.mch-… and planka.casey-…),
+// each its own DSN + group namespace, is a first-class supported config.
+func TestTwoPlankaInstances(t *testing.T) {
+	t.Setenv("MCH_DSN", "postgres://invite:x@localhost/mch")
+	t.Setenv("CASEY_DSN", "postgres://invite:x@localhost/casey")
+	yml := `provisioners:
+  - type: planka-postgres
+    name: planka-mch
+    label: MCH Planka
+    dsn_env: MCH_DSN
+    roles:
+      planka-mch-admins: admin
+      planka-mch-users: boardUser
+  - type: planka-postgres
+    name: planka-casey
+    label: Casey Planka
+    dsn_env: CASEY_DSN
+    roles:
+      planka-casey-admins: admin
+      planka-casey-users: boardUser
+`
+	path := filepath.Join(t.TempDir(), "provisioners.yaml")
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provs, err := provision.Load(path)
+	if err != nil {
+		t.Fatalf("two instances should load: %v", err)
+	}
+	if len(provs) != 2 {
+		t.Fatalf("want 2 provisioners, got %d", len(provs))
+	}
+	mch, casey := provs[0].(*Provisioner), provs[1].(*Provisioner)
+	// Each only recognises its OWN groups -> a user is provisioned into the
+	// instance(s) they're granted, and skipped by the other.
+	if mch.roleFor([]string{"planka-mch-users"}) != "boardUser" {
+		t.Error("mch should map its own group")
+	}
+	if mch.roleFor([]string{"planka-casey-users"}) != "" {
+		t.Error("mch must NOT match casey's group (would cross-provision)")
+	}
+	if casey.roleFor([]string{"planka-casey-admins"}) != "admin" {
+		t.Error("casey should map its own group")
+	}
+	if mch.Info().DisplayName != "MCH Planka" || casey.Info().DisplayName != "Casey Planka" {
+		t.Error("labels not independent")
+	}
+}
+
+func TestDuplicateProvisionerNameRejected(t *testing.T) {
+	t.Setenv("D1", "postgres://x")
+	t.Setenv("D2", "postgres://y")
+	yml := `provisioners:
+  - {type: planka-postgres, name: planka, dsn_env: D1, roles: {g: admin}}
+  - {type: planka-postgres, name: planka, dsn_env: D2, roles: {g: admin}}
+`
+	path := filepath.Join(t.TempDir(), "provisioners.yaml")
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provision.Load(path); err == nil {
+		t.Error("duplicate provisioner names should be rejected")
+	}
+}
