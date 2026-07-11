@@ -55,8 +55,10 @@ type roleRule struct {
 var validPlankaRoles = map[string]bool{"admin": true, "projectOwner": true, "boardUser": true}
 
 type Provisioner struct {
-	name string
-	pool *pgxpool.Pool
+	name    string
+	label   string
+	url     string
+	pool    *pgxpool.Pool
 	// roles maps SSO groups to Planka roles in privilege order (first match
 	// wins), e.g. planka-admins->admin, planka-owners->projectOwner,
 	// planka-users->boardUser.
@@ -66,6 +68,8 @@ type Provisioner struct {
 func newFromConfig(name string, cfg *yaml.Node) (*Provisioner, error) {
 	var raw struct {
 		DSNEnv string    `yaml:"dsn_env"`
+		Label  string    `yaml:"label"`
+		URL    string    `yaml:"url"`
 		Roles  yaml.Node `yaml:"roles"`
 	}
 	if err := cfg.Decode(&raw); err != nil {
@@ -103,10 +107,18 @@ func newFromConfig(name string, cfg *yaml.Node) (*Provisioner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	return &Provisioner{name: name, pool: pool, roles: rules}, nil
+	return &Provisioner{name: name, label: raw.Label, url: raw.URL, pool: pool, roles: rules}, nil
 }
 
 func (p *Provisioner) Name() string { return p.name }
+
+func (p *Provisioner) Info() provision.AppInfo {
+	label := p.label
+	if label == "" {
+		label = p.name
+	}
+	return provision.AppInfo{Name: p.name, DisplayName: label, URL: p.url}
+}
 
 // roleFor resolves the Planka role for a group set; "" = out of scope.
 func (p *Provisioner) roleFor(groups []string) string {
@@ -263,11 +275,38 @@ func (p *Provisioner) Provision(ctx context.Context, u provision.User) error {
 	return nil
 }
 
+// Sync reconciles an EXISTING Planka user with the portal's current view
+// after an access (group) change. If the user's groups grant a role, set that
+// role and clear is_deactivated (re-granting access reactivates them); if they
+// grant no role, deactivate (access revoked). A user with no Planka row is
+// left untouched (0 rows affected) — Planka creates them with the right role
+// at first login. This makes an access edit take effect immediately for users
+// already in Planka, rather than only at their next login. The role we set
+// equals what Planka's OIDC mapping would set at login (same documented
+// group->role contract), so there is no flip-flop.
+func (p *Provisioner) Sync(ctx context.Context, u provision.User) error {
+	email := strings.ToLower(u.Email)
+	if role := p.roleFor(u.Groups); role != "" {
+		if _, err := p.pool.Exec(ctx,
+			`UPDATE user_account SET role = $2, is_deactivated = false WHERE email = $1`,
+			email, role); err != nil {
+			return fmt.Errorf("update user role: %w", err)
+		}
+		return nil
+	}
+	// No mapped group -> access revoked for this app: deactivate if present.
+	if _, err := p.pool.Exec(ctx,
+		`UPDATE user_account SET is_deactivated = true WHERE email = $1`, email); err != nil {
+		return fmt.Errorf("deactivate user: %w", err)
+	}
+	return nil
+}
+
 func (p *Provisioner) Deprovision(ctx context.Context, u provision.User) error {
 	// Deactivate, never delete: card assignments and history must survive.
 	// 0 rows affected is fine — the user was out of this app's scope.
 	_, err := p.pool.Exec(ctx,
-		`UPDATE user_account SET is_deactivated = true WHERE lower(email) = $1`,
+		`UPDATE user_account SET is_deactivated = true WHERE email = $1`,
 		strings.ToLower(u.Email))
 	if err != nil {
 		return fmt.Errorf("deactivate user: %w", err)

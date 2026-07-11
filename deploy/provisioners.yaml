@@ -3,6 +3,9 @@
 provisioners:
   - type: planka-postgres
     name: planka
+    # Display metadata for the portal's "which apps this controls" note.
+    label: Planka
+    url: https://planka.${DOMAIN}
     dsn_env: PLANKA_DSN
     # SSO group -> Planka role, in privilege order (first match wins).
     roles:

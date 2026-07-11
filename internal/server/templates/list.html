@@ -1,5 +1,14 @@
 {{template "head" .}}
 <h1>Users</h1>
+<div class="notice">
+  {{if .AppInfos}}
+  Accounts you create here also apply to:
+  {{range $i, $a := .AppInfos}}{{if $i}}, {{end}}<strong>{{$a.DisplayName}}</strong>{{if $a.URL}} (<a href="{{$a.URL}}">{{$a.URL}}</a>){{end}}{{end}}.
+  Access is granted per person below; more apps can be connected over time.
+  {{else}}
+  This portal manages single sign-on accounts. No downstream apps are connected yet.
+  {{end}}
+</div>
 {{range .Warnings}}<div class="warning">{{.}}</div>{{end}}
 <div class="table-wrap">
 <table>

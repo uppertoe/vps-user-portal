@@ -1,7 +1,7 @@
-# Worked example for a server repo: apps/invite/docker-compose.yml
+# Worked example for a server repo: apps/users/docker-compose.yml
 # (vps-base-template estate layout; adjust paths if yours differs).
 services:
-  invite:
+  users:
     # Pin by digest in your server repo (Renovate's pinDigests does this).
     image: ghcr.io/uppertoe/vps-user-portal:latest
     restart: unless-stopped
@@ -31,19 +31,19 @@ services:
       - ../authelia/users:/authelia-users
       - ./provisioners.yaml:/config/provisioners.yaml:ro
     # Proxy-network wiring is generated (.generated/caddy/networks.yml): the
-    # portal joins its own invite_proxy network, which Caddy also joins.
+    # portal joins its own users_proxy network, which Caddy also joins.
     #
-    # For DB access the portal joins a DEDICATED invite_db network that ONLY
+    # For DB access the portal joins a DEDICATED users_db network that ONLY
     # planka-db also joins — NOT planka_internal. This matters: the portal
     # trusts Caddy-injected Remote-User/Remote-Groups headers, which is safe
     # only while Caddy is the sole route to it. If the portal shared
     # planka_internal, the Planka APP container (the least-hardened service on
-    # the box) could reach http://invite:8080/ directly with a forged
+    # the box) could reach http://users:8080/ directly with a forged
     # `Remote-Groups: admin` and seize the SSO user store. A dedicated db-only
     # network removes that path entirely: the portal reaches Postgres, and
     # neither portal<->planka-app direction exists. See README "Trust model".
     networks:
-      - invite_db
+      - users_db
     healthcheck:
       test: ["CMD", "/app", "-healthcheck"]
       interval: 15s
@@ -52,10 +52,10 @@ services:
       start_period: 10s
 
 # A dedicated app<->db network for the portal. In the server repo you also add
-# `invite_db` to the `planka-db` service's networks list in
+# `users_db` to the `planka-db` service's networks list in
 # apps/planka/docker-compose.yml (planka-db then sits on planka_internal AND
-# invite_db; the Planka APP stays on planka_internal only). planka-db publishes
+# users_db; the Planka APP stays on planka_internal only). planka-db publishes
 # no ports and the `invite` Postgres role is INSERT/limited-UPDATE only, so this
 # network's blast radius is one narrowly-scoped DB role.
 networks:
-  invite_db: {}
+  users_db: {}

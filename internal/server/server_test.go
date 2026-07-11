@@ -30,18 +30,26 @@ const usersSeed = `users:
 // stubProvisioner records calls and can be told to fail.
 type stubProvisioner struct {
 	provisioned  []provision.User
+	synced       []provision.User
 	deprovisiond []provision.User
 	failNext     bool
 }
 
-func (s *stubProvisioner) Name() string                    { return "stubapp" }
-func (s *stubProvisioner) Check(context.Context) error     { return nil }
+func (s *stubProvisioner) Name() string { return "stubapp" }
+func (s *stubProvisioner) Info() provision.AppInfo {
+	return provision.AppInfo{Name: "stubapp", DisplayName: "Stub App", URL: "https://stub.example.org"}
+}
+func (s *stubProvisioner) Check(context.Context) error { return nil }
 func (s *stubProvisioner) Provision(_ context.Context, u provision.User) error {
 	if s.failNext {
 		s.failNext = false
 		return context.DeadlineExceeded
 	}
 	s.provisioned = append(s.provisioned, u)
+	return nil
+}
+func (s *stubProvisioner) Sync(_ context.Context, u provision.User) error {
+	s.synced = append(s.synced, u)
 	return nil
 }
 func (s *stubProvisioner) Deprovision(_ context.Context, u provision.User) error {
@@ -272,7 +280,7 @@ func TestDeleteRequiresConfirmation(t *testing.T) {
 }
 
 func TestSetGroups(t *testing.T) {
-	srv, _, store := newTestServer(t)
+	srv, stub, store := newTestServer(t)
 	form := url.Values{
 		"groups": {"planka-owners"},
 		"csrf":   {csrfToken(srv.cfg.CSRFSecret, "admin@example.org", time.Now())},
@@ -285,5 +293,12 @@ func TestSetGroups(t *testing.T) {
 	u, _ := store.Get("alice")
 	if len(u.Groups) != 1 || u.Groups[0] != "planka-owners" {
 		t.Errorf("groups not updated: %v", u.Groups)
+	}
+	// Editing access must Sync connected apps immediately (not wait for login).
+	if len(stub.synced) != 1 || stub.synced[0].Email != "alice@example.org" {
+		t.Errorf("provisioner Sync not called on access edit: %+v", stub.synced)
+	}
+	if stub.synced[0].Groups[0] != "planka-owners" {
+		t.Errorf("Sync got stale groups: %v", stub.synced[0].Groups)
 	}
 }

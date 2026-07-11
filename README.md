@@ -132,7 +132,7 @@ the SSO user already exists, so the app simply creates them at first login
 ## Deploying
 
 See [`deploy/`](deploy/) for a worked compose + Caddy example matching the
-server-repo layout (`apps/invite/`). The image is published to
+server-repo layout (`apps/users/`, exposed at `users.<domain>`). The image is published to
 `ghcr.io/uppertoe/vps-user-portal` — pin it by digest in production.
 
 Container healthcheck: `/app -healthcheck` probes `/healthz` (which reflects

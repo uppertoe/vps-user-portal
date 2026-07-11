@@ -41,10 +41,20 @@ type AppStatus struct {
 	Deactivated bool
 }
 
-// Provisioner pre-creates and deactivates users in one downstream app.
+// AppInfo is display metadata about a managed app, for the UI ("which apps
+// does this portal control?").
+type AppInfo struct {
+	Name        string // internal provisioner name, e.g. "planka"
+	DisplayName string // human name, e.g. "Planka" (falls back to Name)
+	URL         string // optional public URL, e.g. https://planka.example.org
+}
+
+// Provisioner pre-creates, updates and deactivates users in one downstream app.
 type Provisioner interface {
 	// Name labels this provisioner in the UI and audit log.
 	Name() string
+	// Info returns display metadata for the UI.
+	Info() AppInfo
 	// Check asserts the integration's assumptions (e.g. database schema)
 	// hold. It runs at startup and periodically; failure turns the portal's
 	// health endpoint red so a drifted app upgrade is caught loudly before
@@ -56,6 +66,13 @@ type Provisioner interface {
 	// self-heals (the app creates the user at first SSO login); the portal
 	// surfaces the failure to the admin and the audit log.
 	Provision(ctx context.Context, u User) error
+	// Sync reconciles an EXISTING app user with the portal's current view
+	// after an access (group) change: update the mapped role, reactivate a
+	// user who regained access, or deactivate one whose groups no longer
+	// grant any role. A user with no app row is left alone (they get the
+	// right role when the app creates them at first login). This is what
+	// makes an access edit take effect immediately rather than at next login.
+	Sync(ctx context.Context, u User) error
 	// Deprovision deactivates (never deletes) the user in the app, so
 	// history survives offboarding. Called AFTER the SSO entry is removed —
 	// severing SSO is the security-critical step and goes first.

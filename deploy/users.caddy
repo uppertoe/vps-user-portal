@@ -1,6 +1,6 @@
-# Server-repo snippet: apps/invite/invite.caddy
+# Server-repo snippet: apps/users/users.caddy
 # Admin door only: the portal manages the SSO user store, so it sits behind
 # the gateway's admin guard (email OTP + TOTP; break-glass sessions excluded).
-invite.{$DOMAIN} {
-	import protected_admin invite:8080
+users.{$DOMAIN} {
+	import protected_admin users:8080
 }

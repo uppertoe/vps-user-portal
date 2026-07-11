@@ -219,6 +219,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "list.html", map[string]any{
 		"Rows":     rows,
 		"Apps":     s.provisionerNames(),
+		"AppInfos": s.appInfos(),
 		"Warnings": warnings,
 	})
 }
@@ -325,10 +326,30 @@ func (s *Server) handleSetGroups(w http.ResponseWriter, r *http.Request) {
 	adm := actor(r)
 	username := r.PathValue("username")
 	groups := s.selectedGroups(r)
-	err := s.store.SetGroups(username, groups)
-	s.audit.Event(adm.User, "set-groups", username, "groups="+strings.Join(groups, " "), err)
-	if err != nil {
+	if err := s.store.SetGroups(username, groups); err != nil {
+		s.audit.Event(adm.User, "set-access", username, "groups="+strings.Join(groups, " "), err)
 		s.fail(w, r, err)
+		return
+	}
+	// Push the new access into connected apps NOW (update role / reactivate /
+	// deactivate) so an edit takes effect immediately rather than only at the
+	// user's next login. Non-fatal: a failure just defers to next login.
+	var warnings []string
+	if u, err := s.store.Get(username); err == nil {
+		pu := provision.User{Username: u.Username, DisplayName: u.DisplayName, Email: u.Email, Groups: u.Groups}
+		for _, p := range s.provs {
+			if err := p.Sync(r.Context(), pu); err != nil {
+				warnings = append(warnings, fmt.Sprintf("%s: couldn't apply the change immediately: %v (it will apply at the user's next login)", p.Name(), err))
+			}
+		}
+	}
+	s.audit.Event(adm.User, "set-access", username, fmt.Sprintf("groups=%s warnings=%d", strings.Join(groups, " "), len(warnings)), nil)
+	if len(warnings) > 0 {
+		s.render(w, r, "message.html", map[string]any{
+			"Title":    "Access updated",
+			"Message":  fmt.Sprintf("Access for %s was saved.", username),
+			"Warnings": warnings,
+		})
 		return
 	}
 	http.Redirect(w, r, "/users/"+username, http.StatusSeeOther)
@@ -433,6 +454,14 @@ func (s *Server) provisionerNames() []string {
 		names[i] = p.Name()
 	}
 	return names
+}
+
+func (s *Server) appInfos() []provision.AppInfo {
+	out := make([]provision.AppInfo, len(s.provs))
+	for i, p := range s.provs {
+		out[i] = p.Info()
+	}
+	return out
 }
 
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {

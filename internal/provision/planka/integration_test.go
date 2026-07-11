@@ -95,6 +95,50 @@ func TestIntegrationProvisionInsertsRealRow(t *testing.T) {
 	}
 }
 
+func TestIntegrationSyncUpdatesRoleAndReactivation(t *testing.T) {
+	ctx := context.Background()
+	pool := testPool(t)
+	p := testProvisioner(t, pool)
+	email := "int-test-sync@example.org"
+	_, _ = pool.Exec(ctx, `DELETE FROM user_account WHERE lower(email)=$1`, email)
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM user_account WHERE lower(email)=$1`, email) })
+
+	u := provision.User{Username: "inttestsync", DisplayName: "Sync", Email: email, Groups: []string{"planka-users"}}
+	if err := p.Provision(ctx, u); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+
+	// Promote boardUser -> projectOwner: Sync must update the live row now.
+	u.Groups = []string{"planka-owners"}
+	if err := p.Sync(ctx, u); err != nil {
+		t.Fatalf("sync promote: %v", err)
+	}
+	st, _ := p.Status(ctx, []string{email})
+	if st[email].Role != "projectOwner" || st[email].Deactivated {
+		t.Errorf("after promote want projectOwner/active, got %+v", st[email])
+	}
+
+	// Remove all mapped groups: Sync must deactivate (access revoked).
+	u.Groups = []string{"unrelated"}
+	if err := p.Sync(ctx, u); err != nil {
+		t.Fatalf("sync revoke: %v", err)
+	}
+	st, _ = p.Status(ctx, []string{email})
+	if !st[email].Deactivated {
+		t.Errorf("after revoking access want deactivated, got %+v", st[email])
+	}
+
+	// Re-grant access: Sync must reactivate and set the role.
+	u.Groups = []string{"planka-users"}
+	if err := p.Sync(ctx, u); err != nil {
+		t.Fatalf("sync regrant: %v", err)
+	}
+	st, _ = p.Status(ctx, []string{email})
+	if st[email].Role != "boardUser" || st[email].Deactivated {
+		t.Errorf("after re-grant want boardUser/active, got %+v", st[email])
+	}
+}
+
 func TestIntegrationProvisionRejectsDuplicateEmail(t *testing.T) {
 	ctx := context.Background()
 	pool := testPool(t)
