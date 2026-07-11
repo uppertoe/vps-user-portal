@@ -15,7 +15,7 @@ table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
 a { color: var(--accent); }
-.tag { display: inline-block; background: var(--soft); border: 1px solid var(--line); border-radius: 999px; padding: 0 0.6em; font-size: 0.8rem; margin: 0 0.15em 0.15em 0; }
+.tag { display: inline-block; white-space: nowrap; background: var(--soft); border: 1px solid var(--line); border-radius: 999px; padding: 0 0.6em; font-size: 0.8rem; margin: 0 0.15em 0.15em 0; }
 .muted { color: var(--muted); }
 .ok { color: var(--ok); }
 .danger { color: var(--danger); }

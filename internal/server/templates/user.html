@@ -5,9 +5,9 @@
 <div class="table-wrap">
 <table>
   <tr><th>App</th><th>Status</th></tr>
-  {{range $name, $st := .Apps}}
-  <tr><td>{{$name}}</td>
-      <td>{{if not $st.Present}}<span class="muted">not present (created at first login)</span>{{else if $st.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{$st.Role}}</span>{{end}}</td></tr>
+  {{range .Apps}}
+  <tr><td>{{.DisplayName}}</td>
+      <td>{{if not .Status.Present}}<span class="muted">not present (created at first login)</span>{{else if .Status.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{.Status.Role}}</span>{{end}}</td></tr>
   {{end}}
 </table>
 </div>

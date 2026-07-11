@@ -14,7 +14,7 @@
 <table>
   <tr>
     <th>User</th><th>Email</th><th>Groups</th>
-    {{range .Apps}}<th>{{.}}</th>{{end}}
+    {{range .AppInfos}}<th>{{.DisplayName}}</th>{{end}}
   </tr>
   {{range .Rows}}
   <tr>
@@ -22,8 +22,8 @@
     <td>{{.Email}}</td>
     <td>{{range .Groups}}<span class="tag">{{.}}</span>{{end}}</td>
     {{$apps := .Apps}}
-    {{range $.Apps}}
-      {{$st := index $apps .}}
+    {{range $.AppInfos}}
+      {{$st := index $apps .Name}}
       <td>{{if not $st.Present}}<span class="muted">&mdash;</span>{{else if $st.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{$st.Role}}</span>{{end}}</td>
     {{end}}
   </tr>

@@ -191,6 +191,13 @@ type userRow struct {
 	Apps map[string]provision.AppStatus // provisioner name -> status
 }
 
+// appStatusRow is one app's status on the user-detail page, carrying the
+// friendly DisplayName (not the raw provisioner name) for display.
+type appStatusRow struct {
+	DisplayName string
+	Status      provision.AppStatus
+}
+
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	users, err := s.store.List()
 	if err != nil {
@@ -307,11 +314,11 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	apps := map[string]provision.AppStatus{}
+	var apps []appStatusRow
 	for _, p := range s.provs {
 		st, err := p.Status(r.Context(), []string{strings.ToLower(u.Email)})
 		if err == nil {
-			apps[p.Name()] = st[strings.ToLower(u.Email)]
+			apps = append(apps, appStatusRow{DisplayName: p.Info().DisplayName, Status: st[strings.ToLower(u.Email)]})
 		}
 	}
 	s.render(w, r, "user.html", map[string]any{
