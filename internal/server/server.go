@@ -225,7 +225,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInviteForm(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "invite.html", map[string]any{
-		"Groups":   s.cfg.Groups,
+		"Groups":   s.cfg.GroupOptions(),
 		"Domains":  s.cfg.AllowedEmailDomains,
 		"Selected": map[string]bool{},
 	})
@@ -243,7 +243,7 @@ func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.validateInvite(emailAddr, displayName, &username, groups); err != nil {
 		s.render(w, r, "invite.html", map[string]any{
-			"Groups": s.cfg.Groups, "Domains": s.cfg.AllowedEmailDomains,
+			"Groups": s.cfg.GroupOptions(), "Domains": s.cfg.AllowedEmailDomains,
 			"Error": err.Error(),
 			"Email": emailAddr, "DisplayName": displayName, "Username": username, "Selected": toSet(groups),
 		})
@@ -269,7 +269,7 @@ func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 		// s.fail path so host paths never reach the page.
 		if errors.Is(err, userstore.ErrDuplicate) {
 			s.render(w, r, "invite.html", map[string]any{
-				"Groups": s.cfg.Groups, "Domains": s.cfg.AllowedEmailDomains,
+				"Groups": s.cfg.GroupOptions(), "Domains": s.cfg.AllowedEmailDomains,
 				"Error": err.Error(),
 				"Email": emailAddr, "DisplayName": displayName, "Username": username, "Selected": toSet(groups),
 			})
@@ -314,7 +314,7 @@ func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.render(w, r, "user.html", map[string]any{
-		"U": u, "Groups": s.cfg.Groups, "Selected": toSet(u.Groups), "Apps": apps,
+		"U": u, "Groups": s.cfg.GroupOptions(), "Selected": toSet(u.Groups), "Apps": apps,
 	})
 }
 

@@ -2,6 +2,7 @@
 <h1>{{.U.DisplayName}} <span class="muted">({{.U.Username}})</span></h1>
 <p>{{.U.Email}}</p>
 {{if .Apps}}
+<div class="table-wrap">
 <table>
   <tr><th>App</th><th>Status</th></tr>
   {{range $name, $st := .Apps}}
@@ -9,18 +10,19 @@
       <td>{{if not $st.Present}}<span class="muted">not present (created at first login)</span>{{else if $st.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{$st.Role}}</span>{{end}}</td></tr>
   {{end}}
 </table>
+</div>
 {{end}}
 
 <form class="stack" method="post" action="/users/{{.U.Username}}/groups">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <label>Groups <span class="hint">(app roles follow at the user's next login)</span></label>
+  <label>Access <span class="hint">(app roles follow at the user's next login)</span></label>
   <div class="checks">
     {{$sel := .Selected}}
     {{range .Groups}}
-    <label><input type="checkbox" name="groups" value="{{.}}"{{if index $sel .}} checked{{end}}> {{.}}</label>
+    <label><input type="checkbox" name="groups" value="{{.Value}}"{{if index $sel .Value}} checked{{end}}> {{.Label}}{{if ne .Label .Value}} <span class="hint">({{.Value}})</span>{{end}}</label>
     {{end}}
   </div>
-  <button type="submit">Save groups</button>
+  <button type="submit">Save access</button>
 </form>
 
 <section class="danger-zone">

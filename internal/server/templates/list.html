@@ -1,6 +1,7 @@
 {{template "head" .}}
 <h1>Users</h1>
 {{range .Warnings}}<div class="warning">{{.}}</div>{{end}}
+<div class="table-wrap">
 <table>
   <tr>
     <th>User</th><th>Email</th><th>Groups</th>
@@ -21,4 +22,5 @@
   <tr><td colspan="9" class="muted">No users yet — <a href="/invite">invite the first one</a>.</td></tr>
   {{end}}
 </table>
+</div>
 {{template "foot" .}}

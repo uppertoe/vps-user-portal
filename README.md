@@ -120,6 +120,7 @@ the SSO user already exists, so the app simply creates them at first login
 | `PROVISIONERS_FILE` | *(empty)* | Path to `provisioners.yaml`; empty = Authelia-only. |
 | `ALLOWED_EMAIL_DOMAINS` | *(required)* | Invitable email domains, comma/space-separated. |
 | `GROUPS` | *(required)* | Groups offered on the invite form. |
+| `GROUP_LABELS` | *(empty)* | Optional human labels for the groups (`group=Label;group2=Label2`), so admins see e.g. "Administrator" instead of `planka-admins`. The raw slug still shows in muted text. |
 | `ADMIN_GROUP` | `admin` | `Remote-Groups` entry required on every request. |
 | `CSRF_SECRET` | *(required)* | ≥32 chars (`openssl rand -hex 32`). |
 | `SSO_URL` | *(required)* | Authelia portal URL, e.g. `https://sso.example.org`. |

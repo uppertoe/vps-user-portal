@@ -25,6 +25,11 @@ type Config struct {
 	AllowedEmailDomains []string
 	// Groups are the group names offered as checkboxes on the invite form.
 	Groups []string
+	// GroupLabels optionally maps a group name to a human label shown on the
+	// forms (e.g. planka-admins -> "Administrator"), so non-technical admins
+	// aren't picking from raw group slugs. Groups without a label show their
+	// raw name. Parsed from GROUP_LABELS ("group=Label;group2=Label2").
+	GroupLabels map[string]string
 	// AdminGroup is the Remote-Groups entry required on every request
 	// (defence in depth behind Caddy's protected_admin gate).
 	AdminGroup string
@@ -55,6 +60,41 @@ func get(key, fallback string) string {
 	return fallback
 }
 
+// GroupOption pairs a group's raw value with its display label (the raw name
+// when no label is configured).
+type GroupOption struct {
+	Value string
+	Label string
+}
+
+// GroupOptions returns the configured groups with their display labels, in
+// configured order — for rendering the invite/edit checkboxes.
+func (c *Config) GroupOptions() []GroupOption {
+	out := make([]GroupOption, len(c.Groups))
+	for i, g := range c.Groups {
+		label := c.GroupLabels[g]
+		if label == "" {
+			label = g
+		}
+		out[i] = GroupOption{Value: g, Label: label}
+	}
+	return out
+}
+
+// parseLabels parses "group=Label;group2=Label2" into a map. Malformed pairs
+// (no '=') are skipped.
+func parseLabels(v string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(v, ";") {
+		k, label, ok := strings.Cut(pair, "=")
+		k, label = strings.TrimSpace(k), strings.TrimSpace(label)
+		if ok && k != "" && label != "" {
+			out[k] = label
+		}
+	}
+	return out
+}
+
 // splitList splits a comma- and/or space-separated list.
 func splitList(v string) []string {
 	fields := strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' })
@@ -74,6 +114,7 @@ func Load() (*Config, error) {
 		ProvisionersFile:    get("PROVISIONERS_FILE", ""),
 		AllowedEmailDomains: splitList(strings.ToLower(get("ALLOWED_EMAIL_DOMAINS", ""))),
 		Groups:              splitList(get("GROUPS", "")),
+		GroupLabels:         parseLabels(get("GROUP_LABELS", "")),
 		AdminGroup:          get("ADMIN_GROUP", "admin"),
 		SSOURL:              strings.TrimRight(get("SSO_URL", ""), "/"),
 		EmailBackend:        get("EMAIL_BACKEND", "none"),
