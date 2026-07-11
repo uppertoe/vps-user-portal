@@ -98,6 +98,29 @@ func do(srv *Server, req *http.Request) *httptest.ResponseRecorder {
 	return rec
 }
 
+func TestSharedSecretGate(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	srv.cfg.SharedSecret = "s3cret-proof-of-caddy"
+
+	// Valid admin identity but NO X-Portal-Auth (as a co-tenant reaching the
+	// portal directly, bypassing Caddy) -> refused before Remote-* is trusted.
+	if rec := do(srv, asAdmin(httptest.NewRequest("GET", "/", nil))); rec.Code != http.StatusForbidden {
+		t.Errorf("missing shared secret: want 403, got %d", rec.Code)
+	}
+	// Wrong secret -> refused.
+	req := asAdmin(httptest.NewRequest("GET", "/", nil))
+	req.Header.Set("X-Portal-Auth", "wrong")
+	if rec := do(srv, req); rec.Code != http.StatusForbidden {
+		t.Errorf("wrong shared secret: want 403, got %d", rec.Code)
+	}
+	// Correct secret (what Caddy injects) -> allowed through.
+	req = asAdmin(httptest.NewRequest("GET", "/", nil))
+	req.Header.Set("X-Portal-Auth", "s3cret-proof-of-caddy")
+	if rec := do(srv, req); rec.Code != http.StatusOK {
+		t.Errorf("correct shared secret: want 200, got %d", rec.Code)
+	}
+}
+
 func TestRefusesWithoutAdminIdentity(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	for _, tc := range []struct {

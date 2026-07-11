@@ -108,6 +108,11 @@ func Load(path string) ([]Provisioner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read provisioners config: %w", err)
 	}
+	// Expand ${VAR} references (e.g. url: https://planka.${DOMAIN}) from the
+	// environment. provisioners.yaml is a mounted file, so Compose never
+	// interpolates it — the portal must, or the UI shows a literal ${DOMAIN}.
+	// Undefined vars expand to empty.
+	b = []byte(os.ExpandEnv(string(b)))
 	// Two-pass: get type/name, then hand the raw entry node to the factory.
 	var generic struct {
 		Provisioners []yaml.Node `yaml:"provisioners"`

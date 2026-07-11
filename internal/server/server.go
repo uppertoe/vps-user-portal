@@ -11,6 +11,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -121,6 +122,18 @@ type ctxKey struct{}
 
 func (s *Server) requireAdmin(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Proof-of-Caddy: if a shared secret is configured, require it before
+		// trusting ANY Remote-* header. Caddy injects X-Portal-Auth on the
+		// reverse_proxy; a co-tenant of the portal's networks (e.g. a
+		// compromised planka-db reaching us directly, bypassing Caddy) can't
+		// supply it, so it can't forge Remote-Groups: admin. Constant-time.
+		if s.cfg.SharedSecret != "" {
+			got := r.Header.Get("X-Portal-Auth")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.SharedSecret)) != 1 {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		id := identity{
 			User:   strings.TrimSpace(r.Header.Get("Remote-User")),
 			Email:  strings.TrimSpace(r.Header.Get("Remote-Email")),

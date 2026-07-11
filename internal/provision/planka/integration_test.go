@@ -46,10 +46,85 @@ func testProvisioner(t *testing.T, pool *pgxpool.Pool) *Provisioner {
 	}
 }
 
-func TestIntegrationCheckPassesOnRealSchema(t *testing.T) {
-	p := testProvisioner(t, testPool(t))
+// fullInviteGrants is the exact least-privilege grant set the README/docs
+// prescribe (column-scoped SELECT, no table-wide read of password/PII). Each
+// entry omits the trailing "TO <role>" — makeInviteRole appends the per-test
+// role name.
+var fullInviteGrants = []string{
+	`GRANT SELECT (email, role, is_deactivated) ON user_account`,
+	`GRANT INSERT ON user_account`,
+	`GRANT UPDATE (is_deactivated, role) ON user_account`,
+	`GRANT USAGE ON SEQUENCE next_id_seq`,
+}
+
+// makeInviteRole creates a non-superuser role (named per-test, so parallel or
+// sequential tests never collide) with exactly the given GRANTs and returns a
+// pool connected as it plus the role name. Check() now rejects a superuser, and
+// the harness DSN is the Planka owner (superuser) — so the privilege probe must
+// be exercised as the real narrow role, not the owner.
+func makeInviteRole(t *testing.T, admin *pgxpool.Pool, grants []string) (*pgxpool.Pool, string) {
+	t.Helper()
+	ctx := context.Background()
+	var db string
+	if err := admin.QueryRow(ctx, `SELECT current_database()`).Scan(&db); err != nil {
+		t.Fatalf("current_database: %v", err)
+	}
+	role := strings.ToLower("ip_" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()))
+	drop := func() {
+		for _, q := range []string{
+			`REVOKE ALL ON user_account FROM ` + role,
+			`REVOKE ALL ON SCHEMA public FROM ` + role,
+			`REVOKE ALL ON DATABASE "` + db + `" FROM ` + role,
+			`DROP ROLE IF EXISTS ` + role,
+		} {
+			_, _ = admin.Exec(ctx, q)
+		}
+	}
+	drop()
+	t.Cleanup(drop)
+	setup := []string{
+		`CREATE ROLE ` + role + ` LOGIN PASSWORD 'probe_pw_x9'`,
+		`GRANT CONNECT ON DATABASE "` + db + `" TO ` + role,
+		`GRANT USAGE ON SCHEMA public TO ` + role,
+	}
+	for _, g := range grants {
+		setup = append(setup, g+" TO "+role)
+	}
+	for _, q := range setup {
+		if _, err := admin.Exec(ctx, q); err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+	}
+	cfg := admin.Config().Copy()
+	cfg.ConnConfig.User = role
+	cfg.ConnConfig.Password = "probe_pw_x9"
+	p, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect as %s: %v", role, err)
+	}
+	t.Cleanup(p.Close)
+	return p, role
+}
+
+// The prescribed least-privilege grants (column-scoped SELECT included) pass
+// Check against the real schema — the columns the probe reads are exactly those
+// granted.
+func TestIntegrationCheckPassesWithLeastPrivilegeGrants(t *testing.T) {
+	admin := testPool(t)
+	pool, _ := makeInviteRole(t, admin, fullInviteGrants)
+	p := testProvisioner(t, pool)
 	if err := p.Check(context.Background()); err != nil {
-		t.Fatalf("Check() failed against real Planka schema: %v", err)
+		t.Fatalf("Check() failed with the prescribed least-privilege grants: %v", err)
+	}
+}
+
+// A DSN pointed at the Planka owner (superuser) must be rejected — least
+// privilege is otherwise entirely operator-enforced.
+func TestIntegrationCheckRejectsSuperuser(t *testing.T) {
+	p := testProvisioner(t, testPool(t)) // testPool connects as the superuser owner
+	err := p.Check(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "SUPERUSER") {
+		t.Fatalf("want a superuser-rejection error, got %v", err)
 	}
 }
 
@@ -145,53 +220,17 @@ func TestIntegrationSyncUpdatesRoleAndReactivation(t *testing.T) {
 // insert. Check() must fail (red /healthz) at startup, not at first invite.
 func TestIntegrationCheckDetectsMissingSequenceGrant(t *testing.T) {
 	ctx := context.Background()
-	admin := testPool(t) // connects as the superuser/owner
-
-	var db string
-	if err := admin.QueryRow(ctx, `SELECT current_database()`).Scan(&db); err != nil {
-		t.Fatalf("current_database: %v", err)
-	}
-	const role, pw = "invite_probe_test", "probe_pw_x9"
-	drop := func() {
-		for _, q := range []string{
-			`REVOKE ALL ON user_account FROM ` + role,
-			`REVOKE ALL ON SCHEMA public FROM ` + role,
-			`REVOKE ALL ON DATABASE "` + db + `" FROM ` + role,
-			`DROP ROLE IF EXISTS ` + role,
-		} {
-			_, _ = admin.Exec(ctx, q)
-		}
-	}
-	drop() // clear any leftover from a failed run
-	t.Cleanup(drop)
-	for _, q := range []string{
-		`CREATE ROLE ` + role + ` LOGIN PASSWORD '` + pw + `'`,
-		`GRANT CONNECT ON DATABASE "` + db + `" TO ` + role,
-		`GRANT USAGE ON SCHEMA public TO ` + role,
-		`GRANT SELECT, INSERT ON user_account TO ` + role,
-		`GRANT UPDATE (is_deactivated, role) ON user_account TO ` + role,
-		// deliberately NOT: GRANT USAGE ON SEQUENCE next_id_seq
-	} {
-		if _, err := admin.Exec(ctx, q); err != nil {
-			t.Fatalf("setup %q: %v", q, err)
-		}
-	}
-
-	cfg := admin.Config().Copy()
-	cfg.ConnConfig.User = role
-	cfg.ConnConfig.Password = pw
-	limited, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("connect as %s: %v", role, err)
-	}
-	defer limited.Close()
-
+	admin := testPool(t)
+	// Everything EXCEPT the sequence grant.
+	limited, role := makeInviteRole(t, admin, []string{
+		`GRANT SELECT (email, role, is_deactivated) ON user_account`,
+		`GRANT INSERT ON user_account`,
+		`GRANT UPDATE (is_deactivated, role) ON user_account`,
+	})
 	p := testProvisioner(t, limited)
-	err = p.Check(ctx)
-	if err == nil || !strings.Contains(err.Error(), "next_id_seq") {
+	if err := p.Check(ctx); err == nil || !strings.Contains(err.Error(), "next_id_seq") {
 		t.Fatalf("want a missing-sequence-grant error, got %v", err)
 	}
-
 	// Granting the sequence makes Check pass — confirms that was the only gap.
 	if _, err := admin.Exec(ctx, `GRANT USAGE ON SEQUENCE next_id_seq TO `+role); err != nil {
 		t.Fatalf("grant sequence: %v", err)

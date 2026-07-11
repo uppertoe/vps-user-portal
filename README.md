@@ -96,22 +96,29 @@ Create a dedicated, narrowly-granted role:
 ```sql
 CREATE ROLE invite LOGIN PASSWORD '...';
 GRANT CONNECT ON DATABASE planka TO invite;
-GRANT SELECT, INSERT ON user_account TO invite;
+GRANT SELECT (email, role, is_deactivated) ON user_account TO invite;
+GRANT INSERT ON user_account TO invite;
 GRANT UPDATE (is_deactivated, role) ON user_account TO invite;
 GRANT USAGE ON SEQUENCE next_id_seq TO invite;
 ```
 
-The sequence grant is easy to overlook but required: `user_account.id` defaults
-to `next_id()`, which calls `nextval('next_id_seq')` as the inserting role, so
-without it every invite fails with *permission denied for sequence
-next_id_seq*.
+Two subtleties:
+- **SELECT is column-scoped.** The portal only reads `email`, `role`,
+  `is_deactivated`, so it is granted SELECT on just those columns — never the
+  whole row (which holds `password`, `api_key_hash`, phone, etc. for every
+  user). Table-wide `GRANT SELECT` would work but over-exposes PII/credential
+  hashes on a portal or DSN compromise.
+- **The sequence grant is required.** `user_account.id` defaults to `next_id()`,
+  which calls `nextval('next_id_seq')` as the inserting role, so without it
+  every invite fails with *permission denied for sequence next_id_seq*.
 
 Both the schema **and** these grants are guarded: at startup (fail-fast) and
 every 5 minutes the provisioner asserts the `user_account` columns it relies on
-against `information_schema` **and** probes that the role actually holds the
-SELECT/INSERT/UPDATE/sequence privileges above. A mismatch or a missing grant
-turns `/healthz` unhealthy so `docker compose up --wait` fails loudly instead of
-risking bad writes or a first-invite surprise.
+against `information_schema` **and** probes that the connected role holds exactly
+these privileges — including that it is **not a superuser** (a DSN accidentally
+pointed at the Planka owner is rejected). A mismatch, a missing grant, or an
+over-privileged role turns `/healthz` unhealthy so `docker compose up --wait`
+fails loudly instead of risking bad writes or a first-invite surprise.
 
 A user whose groups match none of the `roles` keys is out of the app's scope
 and skipped. A provisioner failure during invite is **non-fatal by design**:

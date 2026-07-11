@@ -33,6 +33,13 @@ type Config struct {
 	// AdminGroup is the Remote-Groups entry required on every request
 	// (defence in depth behind Caddy's protected_admin gate).
 	AdminGroup string
+	// SharedSecret, if set, must arrive as the X-Portal-Auth header on every
+	// request BEFORE Remote-* is trusted. Caddy injects it (from the same
+	// value in its env) on the reverse_proxy to the portal; nothing else on
+	// the portal's networks knows it. This closes the forged-header path where
+	// a co-tenant of the DB network (e.g. a compromised planka-db) reaches the
+	// portal directly and spoofs Remote-Groups: admin. Empty = not enforced.
+	SharedSecret string
 	// CSRFSecret keys the HMAC CSRF tokens. Required, >= 32 bytes.
 	CSRFSecret []byte
 	// SSOURL is the Authelia portal URL shown in welcome emails and the UI,
@@ -116,6 +123,7 @@ func Load() (*Config, error) {
 		Groups:              splitList(get("GROUPS", "")),
 		GroupLabels:         parseLabels(get("GROUP_LABELS", "")),
 		AdminGroup:          get("ADMIN_GROUP", "admin"),
+		SharedSecret:        os.Getenv("PORTAL_SHARED_SECRET"),
 		SSOURL:              strings.TrimRight(get("SSO_URL", ""), "/"),
 		EmailBackend:        get("EMAIL_BACKEND", "none"),
 		EmailHost:           get("EMAIL_HOST", ""),

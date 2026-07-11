@@ -155,3 +155,23 @@ func TestDuplicateProvisionerNameRejected(t *testing.T) {
 		t.Error("duplicate provisioner names should be rejected")
 	}
 }
+
+// A ${VAR} in the config (e.g. url: https://planka.${DOMAIN}) must be expanded
+// from the environment at load -- provisioners.yaml is a mounted file Compose
+// never interpolates, so a literal ${DOMAIN} would otherwise show in the UI.
+func TestURLEnvExpansion(t *testing.T) {
+	t.Setenv("TEST_PLANKA_DSN", "postgres://invite:x@localhost/planka")
+	t.Setenv("DOMAIN", "rch-anaesthesia.org")
+	yml := "provisioners:\n  - type: planka-postgres\n    name: planka\n    label: Planka\n    url: https://planka.${DOMAIN}\n    dsn_env: TEST_PLANKA_DSN\n    roles:\n      planka-users: boardUser\n"
+	path := filepath.Join(t.TempDir(), "provisioners.yaml")
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provs, err := provision.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := provs[0].Info().URL; got != "https://planka.rch-anaesthesia.org" {
+		t.Errorf("url not expanded: got %q", got)
+	}
+}
