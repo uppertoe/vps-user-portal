@@ -98,13 +98,20 @@ CREATE ROLE invite LOGIN PASSWORD '...';
 GRANT CONNECT ON DATABASE planka TO invite;
 GRANT SELECT, INSERT ON user_account TO invite;
 GRANT UPDATE (is_deactivated, role) ON user_account TO invite;
+GRANT USAGE ON SEQUENCE next_id_seq TO invite;
 ```
 
-Schema coupling is guarded: at startup (fail-fast) and every 5 minutes the
-provisioner asserts the `user_account` columns it relies on against
-`information_schema`; a mismatch (e.g. after a Planka major upgrade) turns
-`/healthz` unhealthy so `docker compose up --wait` fails loudly instead of
-risking bad writes.
+The sequence grant is easy to overlook but required: `user_account.id` defaults
+to `next_id()`, which calls `nextval('next_id_seq')` as the inserting role, so
+without it every invite fails with *permission denied for sequence
+next_id_seq*.
+
+Both the schema **and** these grants are guarded: at startup (fail-fast) and
+every 5 minutes the provisioner asserts the `user_account` columns it relies on
+against `information_schema` **and** probes that the role actually holds the
+SELECT/INSERT/UPDATE/sequence privileges above. A mismatch or a missing grant
+turns `/healthz` unhealthy so `docker compose up --wait` fails loudly instead of
+risking bad writes or a first-invite surprise.
 
 A user whose groups match none of the `roles` keys is out of the app's scope
 and skipped. A provisioner failure during invite is **non-fatal by design**:
