@@ -12,9 +12,12 @@
 // password login path ever exists for it. Offboarding deactivates
 // (is_deactivated=true) rather than deleting, preserving card history.
 //
-// The portal's database role must be narrowly granted:
+// The portal's database role must be narrowly granted (least privilege — the
+// role is LOGIN-only, non-superuser, and SELECT is column-scoped so it can't
+// read password/api_key_hash/PII columns):
 //
-//	GRANT SELECT, INSERT ON user_account TO invite;
+//	GRANT SELECT (email, role, is_deactivated) ON user_account TO invite;
+//	GRANT INSERT ON user_account TO invite;
 //	GRANT UPDATE (is_deactivated, role) ON user_account TO invite;
 //	GRANT USAGE ON SEQUENCE next_id_seq TO invite;
 //
@@ -226,33 +229,52 @@ func (p *Provisioner) Check(ctx context.Context) error {
 	return p.checkGrants(ctx)
 }
 
-// checkGrants probes that the connection's role actually holds the privileges
-// Provision/Sync need, so a mis-granted role turns /healthz red at startup
-// rather than failing silently on the first invite. Probing (has_*_privilege)
-// consumes nothing — it does not call nextval, so it never burns an id.
+// checkGrants probes that the connection's role holds EXACTLY the privileges
+// Provision/Sync need — no more, no less — so a mis-granted role turns /healthz
+// red at startup rather than failing silently on the first invite. Probing
+// (has_*_privilege) consumes nothing — it never calls nextval, so it burns no id.
+//
+// SELECT is probed at COLUMN granularity (email, role, is_deactivated — the only
+// columns the portal reads) rather than table-wide, so the role can be granted
+// least-privilege column SELECT (keeping it away from password/api_key_hash/PII)
+// and still pass. has_table_privilege(...,'SELECT') would return false under a
+// column-only grant, which is why the column probes are used here.
 //
 // The sequence grant is the subtle one: id defaults to next_id(), which does
 // nextval('next_id_seq') as the caller, so INSERT needs USAGE on that sequence.
 // If Planka ever renames it, to_regclass returns NULL and we skip the sequence
 // probe (the id-default / insert path then surfaces the real problem) rather
 // than emit a false failure.
+//
+// It also asserts the role is NOT a superuser: least privilege is otherwise
+// entirely operator-enforced, and a DSN accidentally pointed at the `planka`
+// owner would pass every has_*_privilege check while holding full DDL/DML.
 func (p *Provisioner) checkGrants(ctx context.Context) error {
-	var canSelect, canInsert, canDeact, canRole, seqOK bool
+	var selEmail, selRole, selDeact, canInsert, updDeact, updRole, seqOK, isSuper bool
 	if err := p.pool.QueryRow(ctx, `
-		SELECT has_table_privilege(current_user, 'user_account', 'SELECT'),
+		SELECT has_column_privilege(current_user, 'user_account', 'email', 'SELECT'),
+		       has_column_privilege(current_user, 'user_account', 'role', 'SELECT'),
+		       has_column_privilege(current_user, 'user_account', 'is_deactivated', 'SELECT'),
 		       has_table_privilege(current_user, 'user_account', 'INSERT'),
 		       has_column_privilege(current_user, 'user_account', 'is_deactivated', 'UPDATE'),
 		       has_column_privilege(current_user, 'user_account', 'role', 'UPDATE'),
 		       CASE WHEN to_regclass('next_id_seq') IS NULL THEN true
-		            ELSE has_sequence_privilege(current_user, 'next_id_seq', 'USAGE') END`).
-		Scan(&canSelect, &canInsert, &canDeact, &canRole, &seqOK); err != nil {
+		            ELSE has_sequence_privilege(current_user, 'next_id_seq', 'USAGE') END,
+		       COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)`).
+		Scan(&selEmail, &selRole, &selDeact, &canInsert, &updDeact, &updRole, &seqOK, &isSuper); err != nil {
 		return fmt.Errorf("probe user_account privileges: %w", err)
 	}
-	var missing []string
-	if !canSelect || !canInsert {
-		missing = append(missing, "GRANT SELECT, INSERT ON user_account TO <role>;")
+	if isSuper {
+		return fmt.Errorf("the database role is a SUPERUSER — point PLANKA_DSN at the narrow `invite` role, not the Planka owner")
 	}
-	if !canDeact || !canRole {
+	var missing []string
+	if !selEmail || !selRole || !selDeact {
+		missing = append(missing, "GRANT SELECT (email, role, is_deactivated) ON user_account TO <role>;")
+	}
+	if !canInsert {
+		missing = append(missing, "GRANT INSERT ON user_account TO <role>;")
+	}
+	if !updDeact || !updRole {
 		missing = append(missing, "GRANT UPDATE (is_deactivated, role) ON user_account TO <role>;")
 	}
 	if !seqOK {

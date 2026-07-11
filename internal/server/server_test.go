@@ -98,6 +98,29 @@ func do(srv *Server, req *http.Request) *httptest.ResponseRecorder {
 	return rec
 }
 
+func TestSharedSecretGate(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	srv.cfg.SharedSecret = "s3cret-proof-of-caddy"
+
+	// Valid admin identity but NO X-Portal-Auth (as a co-tenant reaching the
+	// portal directly, bypassing Caddy) -> refused before Remote-* is trusted.
+	if rec := do(srv, asAdmin(httptest.NewRequest("GET", "/", nil))); rec.Code != http.StatusForbidden {
+		t.Errorf("missing shared secret: want 403, got %d", rec.Code)
+	}
+	// Wrong secret -> refused.
+	req := asAdmin(httptest.NewRequest("GET", "/", nil))
+	req.Header.Set("X-Portal-Auth", "wrong")
+	if rec := do(srv, req); rec.Code != http.StatusForbidden {
+		t.Errorf("wrong shared secret: want 403, got %d", rec.Code)
+	}
+	// Correct secret (what Caddy injects) -> allowed through.
+	req = asAdmin(httptest.NewRequest("GET", "/", nil))
+	req.Header.Set("X-Portal-Auth", "s3cret-proof-of-caddy")
+	if rec := do(srv, req); rec.Code != http.StatusOK {
+		t.Errorf("correct shared secret: want 200, got %d", rec.Code)
+	}
+}
+
 func TestRefusesWithoutAdminIdentity(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	for _, tc := range []struct {
@@ -152,7 +175,7 @@ func TestInviteFormRendersCompletely(t *testing.T) {
 	body := rec.Body.String()
 	// A render error truncates the page; the submit button is last, so its
 	// presence proves the template executed to the end.
-	if !strings.Contains(body, "Create user") {
+	if !strings.Contains(body, "Create accounts") {
 		t.Error("invite form truncated (template render error?)")
 	}
 	for _, g := range srv.cfg.Groups {
@@ -161,6 +184,12 @@ func TestInviteFormRendersCompletely(t *testing.T) {
 		}
 	}
 }
+
+// recordingMail records SendWelcome calls so tests can assert email is off by
+// default and sent only when opted in.
+type recordingMail struct{ sent []string }
+
+func (m *recordingMail) SendWelcome(to, _, _ string) error { m.sent = append(m.sent, to); return nil }
 
 func inviteForm(srv *Server, form url.Values) *http.Request {
 	if form.Get("csrf") == "" {
@@ -174,9 +203,8 @@ func inviteForm(srv *Server, form url.Values) *http.Request {
 func TestInviteFlow(t *testing.T) {
 	srv, stub, store := newTestServer(t)
 	rec := do(srv, inviteForm(srv, url.Values{
-		"email":       {"Carol@example.org"},
-		"displayname": {"Carol New"},
-		"groups":      {"planka-users"},
+		"users":  {"Carol@example.org, Carol New"},
+		"groups": {"planka-users"},
 	}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
@@ -185,7 +213,7 @@ func TestInviteFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("carol not in users file: %v", err)
 	}
-	if u.Email != "carol@example.org" || u.Groups[0] != "planka-users" {
+	if u.Email != "carol@example.org" || u.DisplayName != "Carol New" || u.Groups[0] != "planka-users" {
 		t.Errorf("unexpected stored user: %+v", u)
 	}
 	if len(stub.provisioned) != 1 || stub.provisioned[0].Email != "carol@example.org" {
@@ -193,18 +221,68 @@ func TestInviteFlow(t *testing.T) {
 	}
 }
 
+// A batch: valid rows are created, a bad-domain row fails, a duplicate is
+// skipped — and one bad row never rolls back the good ones.
+func TestInviteBatch(t *testing.T) {
+	srv, stub, store := newTestServer(t)
+	mail := &recordingMail{}
+	srv.mail = mail
+	rec := do(srv, inviteForm(srv, url.Values{
+		// derived name, explicit name, bad domain (fails), duplicate seed (skipped)
+		"users":  {"jane.smith@example.org\nbob@example.org, Bob Jones\nx@evil.org\nalice@example.org"},
+		"groups": {"planka-users"},
+	}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	// jane + bob created; alice (dup) and x@evil.org not added → seed + 2 = 3.
+	if users, _ := store.List(); len(users) != 3 {
+		t.Fatalf("want 3 users after batch, got %d", len(users))
+	}
+	jane, err := store.Get("jane.smith")
+	if err != nil || jane.DisplayName != "Jane Smith" { // derived from the local-part
+		t.Errorf("derived display name wrong: %+v (%v)", jane, err)
+	}
+	if len(stub.provisioned) != 2 {
+		t.Errorf("want 2 provisioned (the created ones), got %d", len(stub.provisioned))
+	}
+	// Email is OFF by default: no send_email field posted.
+	if len(mail.sent) != 0 {
+		t.Errorf("no welcome email should be sent by default, sent %v", mail.sent)
+	}
+}
+
+func TestInviteSendsEmailOnlyWhenOptedIn(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	mail := &recordingMail{}
+	srv.mail = mail
+	do(srv, inviteForm(srv, url.Values{
+		"users":      {"dan@example.org"},
+		"groups":     {"planka-users"},
+		"send_email": {"on"},
+	}))
+	if len(mail.sent) != 1 || mail.sent[0] != "dan@example.org" {
+		t.Errorf("opted-in email not sent: %v", mail.sent)
+	}
+}
+
 func TestInviteRejections(t *testing.T) {
 	srv, stub, store := newTestServer(t)
+	// Batch-level errors re-show the form and create nothing.
 	for name, form := range map[string]url.Values{
-		"wrong domain":  {"email": {"x@evil.org"}, "displayname": {"X"}, "groups": {"planka-users"}},
-		"no groups":     {"email": {"x@example.org"}, "displayname": {"X"}},
-		"unknown group": {"email": {"x@example.org"}, "displayname": {"X"}, "groups": {"sneaky-admins"}},
-		"dup email":     {"email": {"alice@example.org"}, "displayname": {"A"}, "groups": {"planka-users"}},
+		"no groups":     {"users": {"x@example.org"}},
+		"unknown group": {"users": {"x@example.org"}, "groups": {"sneaky-admins"}},
+		"empty users":   {"users": {"   \n  "}, "groups": {"planka-users"}},
 	} {
-		rec := do(srv, inviteForm(srv, form))
+		do(srv, inviteForm(srv, form))
 		if users, _ := store.List(); len(users) != 1 {
-			t.Fatalf("%s: user was created (status %d)", name, rec.Code)
+			t.Fatalf("%s: user was created", name)
 		}
+	}
+	// A bad-domain row is reported as failed, not created.
+	do(srv, inviteForm(srv, url.Values{"users": {"x@evil.org"}, "groups": {"planka-users"}}))
+	if users, _ := store.List(); len(users) != 1 {
+		t.Fatal("bad-domain row created a user")
 	}
 	if len(stub.provisioned) != 0 {
 		t.Error("provisioner called for a rejected invite")
@@ -214,10 +292,9 @@ func TestInviteRejections(t *testing.T) {
 func TestInviteRequiresValidCSRF(t *testing.T) {
 	srv, _, store := newTestServer(t)
 	rec := do(srv, inviteForm(srv, url.Values{
-		"email":       {"x@example.org"},
-		"displayname": {"X"},
-		"groups":      {"planka-users"},
-		"csrf":        {"1.bogus"},
+		"users":  {"x@example.org"},
+		"groups": {"planka-users"},
+		"csrf":   {"1.bogus"},
 	}))
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("bad csrf: got %d, want 403", rec.Code)
@@ -231,15 +308,14 @@ func TestProvisionerFailureIsNonFatal(t *testing.T) {
 	srv, stub, store := newTestServer(t)
 	stub.failNext = true
 	rec := do(srv, inviteForm(srv, url.Values{
-		"email":       {"dave@example.org"},
-		"displayname": {"Dave"},
-		"groups":      {"planka-users"},
+		"users":  {"dave@example.org, Dave"},
+		"groups": {"planka-users"},
 	}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "not fatal") {
-		t.Error("warning not surfaced to the admin")
+	if !strings.Contains(rec.Body.String(), "self-heal") {
+		t.Error("provisioner warning not surfaced to the admin")
 	}
 	if _, err := store.Get("dave"); err != nil {
 		t.Error("SSO user should exist even when app provisioning fails")

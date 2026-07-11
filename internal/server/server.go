@@ -11,6 +11,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -100,7 +101,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Content-Security-Policy",
-			"default-src 'none'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+			"default-src 'none'; style-src 'self'; img-src data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cache-Control", "private, no-cache")
@@ -121,6 +122,18 @@ type ctxKey struct{}
 
 func (s *Server) requireAdmin(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Proof-of-Caddy: if a shared secret is configured, require it before
+		// trusting ANY Remote-* header. Caddy injects X-Portal-Auth on the
+		// reverse_proxy; a co-tenant of the portal's networks (e.g. a
+		// compromised planka-db reaching us directly, bypassing Caddy) can't
+		// supply it, so it can't forge Remote-Groups: admin. Constant-time.
+		if s.cfg.SharedSecret != "" {
+			got := r.Header.Get("X-Portal-Auth")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.SharedSecret)) != 1 {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		id := identity{
 			User:   strings.TrimSpace(r.Header.Get("Remote-User")),
 			Email:  strings.TrimSpace(r.Header.Get("Remote-Email")),
@@ -239,73 +252,162 @@ func (s *Server) handleInviteForm(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// inviteEntry is one parsed line of the batch form: "email" or "email, Name".
+type inviteEntry struct {
+	Email       string
+	DisplayName string
+}
+
+// inviteResult is one row's outcome, shown in the batch summary.
+type inviteResult struct {
+	Email  string
+	Status string // "created" | "skipped" | "failed"
+	Detail string // reason (skipped/failed) or non-fatal warnings (created)
+}
+
+// handleInvite processes the batch invite form: one user per line, one set of
+// groups for the whole batch, and an OFF-by-default welcome email. Accounts are
+// created immediately (assignable in Planka before first login); a per-row
+// failure never rolls back earlier rows.
 func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 	if !s.checkCSRF(w, r) {
 		return
 	}
 	adm := actor(r)
-	emailAddr := strings.ToLower(strings.TrimSpace(r.PostFormValue("email")))
-	displayName := strings.TrimSpace(r.PostFormValue("displayname"))
-	username := strings.TrimSpace(r.PostFormValue("username"))
 	groups := s.selectedGroups(r)
+	sendEmail := r.PostFormValue("send_email") == "on"
+	rawUsers := r.PostFormValue("users")
+	entries := parseInviteLines(rawUsers)
 
-	if err := s.validateInvite(emailAddr, displayName, &username, groups); err != nil {
+	reshow := func(msg string) {
 		s.render(w, r, "invite.html", map[string]any{
 			"Groups": s.cfg.GroupOptions(), "Domains": s.cfg.AllowedEmailDomains,
-			"Error": err.Error(),
-			"Email": emailAddr, "DisplayName": displayName, "Username": username, "Selected": toSet(groups),
+			"Error": msg, "Users": rawUsers, "Selected": toSet(groups), "SendEmail": sendEmail,
 		})
+	}
+	if len(groups) == 0 {
+		reshow("Select at least one access level to grant.")
+		return
+	}
+	if len(entries) == 0 {
+		reshow("Enter at least one email address (one per line).")
 		return
 	}
 
-	u := userstore.User{Username: username, DisplayName: displayName, Email: emailAddr, Groups: groups}
-	hash, err := userstore.ThrowawayHash()
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-
-	// Order matters: the SSO user store write goes FIRST. If a downstream
-	// provisioner then fails, the invite self-heals (the app creates the
-	// user at first SSO login); the reverse order would leave orphan app
-	// rows with no SSO user attached.
-	if err := s.store.Add(u, hash); err != nil {
-		s.audit.Event(adm.User, "invite", emailAddr, "groups="+strings.Join(groups, " "), err)
-		// Duplicate username/email are the common, expected mistakes and carry
-		// no sensitive detail (self-authored messages) — show them on the form.
-		// Anything else (e.g. a filesystem failure) goes through the generic
-		// s.fail path so host paths never reach the page.
-		if errors.Is(err, userstore.ErrDuplicate) {
-			s.render(w, r, "invite.html", map[string]any{
-				"Groups": s.cfg.GroupOptions(), "Domains": s.cfg.AllowedEmailDomains,
-				"Error": err.Error(),
-				"Email": emailAddr, "DisplayName": displayName, "Username": username, "Selected": toSet(groups),
-			})
-			return
+	var results []inviteResult
+	created := 0
+	for _, e := range entries {
+		u, err := s.buildInviteUser(e.Email, e.DisplayName, groups)
+		if err != nil {
+			results = append(results, inviteResult{e.Email, "failed", err.Error()})
+			continue
 		}
-		s.fail(w, r, err)
-		return
-	}
-	var warnings []string
-	pu := provision.User{Username: u.Username, DisplayName: u.DisplayName, Email: u.Email, Groups: u.Groups}
-	for _, p := range s.provs {
-		if err := p.Provision(r.Context(), pu); err != nil {
-			warnings = append(warnings, fmt.Sprintf("%s: %v (not fatal — the app will create the user at their first login)", p.Name(), err))
+		hash, herr := userstore.ThrowawayHash()
+		if herr != nil {
+			s.audit.Event(adm.User, "invite", u.Email, "", herr)
+			results = append(results, inviteResult{e.Email, "failed", "internal error creating the account"})
+			continue
 		}
+		// SSO store write FIRST: if a provisioner then fails the invite
+		// self-heals at first login; the reverse would orphan app rows.
+		if err := s.store.Add(u, hash); err != nil {
+			if errors.Is(err, userstore.ErrDuplicate) {
+				results = append(results, inviteResult{e.Email, "skipped", "already exists"})
+			} else {
+				s.audit.Event(adm.User, "invite", u.Email, "", err)
+				results = append(results, inviteResult{e.Email, "failed", "could not write the user store"})
+			}
+			continue
+		}
+		var warns []string
+		pu := provision.User{Username: u.Username, DisplayName: u.DisplayName, Email: u.Email, Groups: u.Groups}
+		for _, p := range s.provs {
+			if err := p.Provision(r.Context(), pu); err != nil {
+				warns = append(warns, fmt.Sprintf("%s: %v (will self-heal at first login)", p.Name(), err))
+			}
+		}
+		if sendEmail {
+			if err := s.mail.SendWelcome(u.Email, u.DisplayName, s.cfg.SSOURL); err != nil {
+				warns = append(warns, "welcome email failed: "+err.Error())
+			}
+		}
+		created++
+		s.audit.Event(adm.User, "invite", u.Email,
+			fmt.Sprintf("username=%s groups=%s email=%t warnings=%d", u.Username, strings.Join(groups, " "), sendEmail, len(warns)), nil)
+		results = append(results, inviteResult{e.Email, "created", strings.Join(warns, "; ")})
 	}
-	mailNote := email.Instructions(emailAddr, s.cfg.SSOURL)
-	if err := s.mail.SendWelcome(emailAddr, displayName, s.cfg.SSOURL); err != nil {
-		warnings = append(warnings, "welcome email failed: "+err.Error()+" — forward the instructions below manually")
-	}
-	s.audit.Event(adm.User, "invite", emailAddr,
-		fmt.Sprintf("username=%s groups=%s warnings=%d", username, strings.Join(groups, " "), len(warnings)), nil)
 
-	s.render(w, r, "message.html", map[string]any{
-		"Title":    "User created",
-		"Message":  fmt.Sprintf("%s (%s) can now be assigned in apps, and has been asked to set their password.", displayName, emailAddr),
-		"Note":     mailNote,
-		"Warnings": warnings,
+	s.render(w, r, "invite-result.html", map[string]any{
+		"Results":   results,
+		"Created":   created,
+		"Total":     len(entries),
+		"SendEmail": sendEmail,
+		"SSOURL":    s.cfg.SSOURL,
 	})
+}
+
+// parseInviteLines turns the textarea into entries: one per non-blank line,
+// "email" or "email, Display Name". Emails are lowercased; duplicates within
+// the paste are collapsed (so the same address isn't created-then-skipped).
+func parseInviteLines(raw string) []inviteEntry {
+	var out []inviteEntry
+	seen := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		emailPart, namePart, _ := strings.Cut(line, ",")
+		addr := strings.ToLower(strings.TrimSpace(emailPart))
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, inviteEntry{Email: addr, DisplayName: strings.TrimSpace(namePart)})
+	}
+	return out
+}
+
+// buildInviteUser validates one entry and derives the username (and display
+// name, if omitted). Groups are validated once by the caller.
+func (s *Server) buildInviteUser(emailAddr, displayName string, groups []string) (userstore.User, error) {
+	local, domain, ok := strings.Cut(emailAddr, "@")
+	if !ok || local == "" || domain == "" || strings.ContainsAny(emailAddr, " \t\r\n") {
+		return userstore.User{}, fmt.Errorf("not a valid email address")
+	}
+	allowed := false
+	for _, d := range s.cfg.AllowedEmailDomains {
+		if domain == d {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return userstore.User{}, fmt.Errorf("domain @%s is not on the allowlist", domain)
+	}
+	if displayName == "" {
+		displayName = deriveDisplayName(local)
+	}
+	if len(displayName) > 100 {
+		return userstore.User{}, fmt.Errorf("display name is too long (max 100 characters)")
+	}
+	username := userstore.DeriveUsername(emailAddr)
+	if !userstore.ValidUsername(username) {
+		return userstore.User{}, fmt.Errorf("could not derive a valid username from the email")
+	}
+	return userstore.User{Username: username, DisplayName: displayName, Email: emailAddr, Groups: groups}, nil
+}
+
+// deriveDisplayName turns an email local-part into a readable name:
+// "jane.smith" -> "Jane Smith". A best-effort default the admin can edit later.
+func deriveDisplayName(local string) string {
+	fields := strings.FieldsFunc(local, func(r rune) bool { return r == '.' || r == '_' || r == '-' || r == '+' })
+	for i, f := range fields {
+		if f != "" {
+			fields[i] = strings.ToUpper(f[:1]) + f[1:]
+		}
+	}
+	name := strings.Join(fields, " ")
+	if name == "" {
+		return local
+	}
+	return name
 }
 
 func (s *Server) handleUser(w http.ResponseWriter, r *http.Request) {
@@ -401,36 +503,6 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
-
-func (s *Server) validateInvite(emailAddr, displayName string, username *string, groups []string) error {
-	local, domain, ok := strings.Cut(emailAddr, "@")
-	if !ok || local == "" || domain == "" || strings.ContainsAny(emailAddr, " \t\r\n") {
-		return fmt.Errorf("enter a valid email address")
-	}
-	allowed := false
-	for _, d := range s.cfg.AllowedEmailDomains {
-		if domain == d {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return fmt.Errorf("email domain %q is not on the allowlist (%s)", domain, strings.Join(s.cfg.AllowedEmailDomains, ", "))
-	}
-	if displayName == "" || len(displayName) > 100 {
-		return fmt.Errorf("enter a display name (max 100 characters)")
-	}
-	if *username == "" {
-		*username = userstore.DeriveUsername(emailAddr)
-	}
-	if !userstore.ValidUsername(*username) {
-		return fmt.Errorf("username %q is invalid (lowercase letters, digits, . _ -)", *username)
-	}
-	if len(groups) == 0 {
-		return fmt.Errorf("select at least one group")
-	}
-	return nil
-}
 
 // selectedGroups returns the posted groups, filtered to the configured set —
 // a client cannot smuggle an unknown group name into the users file.
