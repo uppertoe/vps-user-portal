@@ -16,6 +16,6 @@ later (nothing works until they do). No email is sent unless you tick the box.</
     {{end}}
   </div>
   <label class="toggle"><input type="checkbox" name="send_email"{{if .SendEmail}} checked{{end}}> Also email each person a welcome / password-setup link <span class="hint">(off by default — accounts work without it)</span></label>
-  <button type="submit">Create accounts</button>
+  <button type="submit" class="btn-icon">{{template "icon-user-plus"}}Create accounts</button>
 </form>
 {{template "foot" .}}

@@ -24,7 +24,7 @@
     {{$apps := .Apps}}
     {{range $.AppInfos}}
       {{$st := index $apps .Name}}
-      <td>{{if not $st.Present}}<span class="muted">&mdash;</span>{{else if $st.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{$st.Role}}</span>{{end}}</td>
+      <td>{{if not $st.Present}}<span class="muted">&mdash;</span>{{else if $st.Deactivated}}<span class="stat danger">{{template "icon-x"}}deactivated</span>{{else}}<span class="stat ok">{{template "icon-check"}}{{$st.Role}}</span>{{end}}</td>
     {{end}}
   </tr>
   {{else}}

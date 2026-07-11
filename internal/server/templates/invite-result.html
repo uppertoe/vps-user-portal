@@ -14,7 +14,7 @@
   {{range .Results}}
   <tr>
     <td>{{.Email}}</td>
-    <td>{{if eq .Status "created"}}<span class="ok">created</span>{{else if eq .Status "skipped"}}<span class="muted">skipped</span>{{else}}<span class="danger">failed</span>{{end}}</td>
+    <td>{{if eq .Status "created"}}<span class="stat ok">{{template "icon-check"}}created</span>{{else if eq .Status "skipped"}}<span class="stat muted">{{template "icon-dash"}}skipped</span>{{else}}<span class="stat danger">{{template "icon-x"}}failed</span>{{end}}</td>
     <td class="muted">{{.Detail}}</td>
   </tr>
   {{end}}
