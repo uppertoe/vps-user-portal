@@ -1,0 +1,289 @@
+package server
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/uppertoe/vps-user-portal/internal/audit"
+	"github.com/uppertoe/vps-user-portal/internal/config"
+	"github.com/uppertoe/vps-user-portal/internal/email"
+	"github.com/uppertoe/vps-user-portal/internal/provision"
+	"github.com/uppertoe/vps-user-portal/internal/userstore"
+)
+
+const usersSeed = `users:
+  alice:
+    displayname: Alice Example
+    email: alice@example.org
+    password: "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+    groups:
+      - planka-admins
+`
+
+// stubProvisioner records calls and can be told to fail.
+type stubProvisioner struct {
+	provisioned  []provision.User
+	deprovisiond []provision.User
+	failNext     bool
+}
+
+func (s *stubProvisioner) Name() string                    { return "stubapp" }
+func (s *stubProvisioner) Check(context.Context) error     { return nil }
+func (s *stubProvisioner) Provision(_ context.Context, u provision.User) error {
+	if s.failNext {
+		s.failNext = false
+		return context.DeadlineExceeded
+	}
+	s.provisioned = append(s.provisioned, u)
+	return nil
+}
+func (s *stubProvisioner) Deprovision(_ context.Context, u provision.User) error {
+	s.deprovisiond = append(s.deprovisiond, u)
+	return nil
+}
+func (s *stubProvisioner) Status(_ context.Context, emails []string) (map[string]provision.AppStatus, error) {
+	out := map[string]provision.AppStatus{}
+	for _, u := range s.provisioned {
+		out[strings.ToLower(u.Email)] = provision.AppStatus{Present: true, Role: "boardUser"}
+	}
+	return out, nil
+}
+
+func newTestServer(t *testing.T) (*Server, *stubProvisioner, *userstore.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "users_database.yml")
+	if err := os.WriteFile(path, []byte(usersSeed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		UsersFile:           path,
+		AllowedEmailDomains: []string{"example.org"},
+		Groups:              []string{"planka-users", "planka-owners", "planka-admins"},
+		AdminGroup:          "admin",
+		CSRFSecret:          []byte("0123456789abcdef0123456789abcdef"),
+		SSOURL:              "https://sso.example.org",
+	}
+	stub := &stubProvisioner{}
+	store := userstore.New(path)
+	srv := New(cfg, store, []provision.Provisioner{stub}, email.None{}, &audit.Logger{})
+	return srv, stub, store
+}
+
+func asAdmin(req *http.Request) *http.Request {
+	req.Header.Set("Remote-User", "admin@example.org")
+	req.Header.Set("Remote-Email", "admin@example.org")
+	req.Header.Set("Remote-Groups", "admin,user")
+	return req
+}
+
+func do(srv *Server, req *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestRefusesWithoutAdminIdentity(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	for _, tc := range []struct {
+		name string
+		mod  func(*http.Request)
+	}{
+		{"no headers", func(*http.Request) {}},
+		{"non-admin group", func(r *http.Request) {
+			r.Header.Set("Remote-User", "bob@example.org")
+			r.Header.Set("Remote-Groups", "user")
+		}},
+		{"admin substring but not group", func(r *http.Request) {
+			r.Header.Set("Remote-User", "bob@example.org")
+			r.Header.Set("Remote-Groups", "administrators")
+		}},
+	} {
+		req := httptest.NewRequest("GET", "/", nil)
+		tc.mod(req)
+		if rec := do(srv, req); rec.Code != http.StatusForbidden {
+			t.Errorf("%s: got %d, want 403", tc.name, rec.Code)
+		}
+	}
+}
+
+func TestHealthzNeedsNoIdentity(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	if rec := do(srv, httptest.NewRequest("GET", "/healthz", nil)); rec.Code != http.StatusOK {
+		t.Errorf("healthz: got %d, want 200", rec.Code)
+	}
+}
+
+func TestListShowsUsers(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	rec := do(srv, asAdmin(httptest.NewRequest("GET", "/", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "alice@example.org") {
+		t.Error("list page missing seeded user")
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("weak or missing CSP: %q", csp)
+	}
+}
+
+func TestInviteFormRendersCompletely(t *testing.T) {
+	srv, _, _ := newTestServer(t)
+	rec := do(srv, asAdmin(httptest.NewRequest("GET", "/invite", nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	// A render error truncates the page; the submit button is last, so its
+	// presence proves the template executed to the end.
+	if !strings.Contains(body, "Create user") {
+		t.Error("invite form truncated (template render error?)")
+	}
+	for _, g := range srv.cfg.Groups {
+		if !strings.Contains(body, `value="`+g+`"`) {
+			t.Errorf("group checkbox %q missing", g)
+		}
+	}
+}
+
+func inviteForm(srv *Server, form url.Values) *http.Request {
+	if form.Get("csrf") == "" {
+		form.Set("csrf", csrfToken(srv.cfg.CSRFSecret, "admin@example.org", time.Now()))
+	}
+	req := httptest.NewRequest("POST", "/invite", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return asAdmin(req)
+}
+
+func TestInviteFlow(t *testing.T) {
+	srv, stub, store := newTestServer(t)
+	rec := do(srv, inviteForm(srv, url.Values{
+		"email":       {"Carol@example.org"},
+		"displayname": {"Carol New"},
+		"groups":      {"planka-users"},
+	}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	u, err := store.Get("carol")
+	if err != nil {
+		t.Fatalf("carol not in users file: %v", err)
+	}
+	if u.Email != "carol@example.org" || u.Groups[0] != "planka-users" {
+		t.Errorf("unexpected stored user: %+v", u)
+	}
+	if len(stub.provisioned) != 1 || stub.provisioned[0].Email != "carol@example.org" {
+		t.Errorf("provisioner not called correctly: %+v", stub.provisioned)
+	}
+}
+
+func TestInviteRejections(t *testing.T) {
+	srv, stub, store := newTestServer(t)
+	for name, form := range map[string]url.Values{
+		"wrong domain":  {"email": {"x@evil.org"}, "displayname": {"X"}, "groups": {"planka-users"}},
+		"no groups":     {"email": {"x@example.org"}, "displayname": {"X"}},
+		"unknown group": {"email": {"x@example.org"}, "displayname": {"X"}, "groups": {"sneaky-admins"}},
+		"dup email":     {"email": {"alice@example.org"}, "displayname": {"A"}, "groups": {"planka-users"}},
+	} {
+		rec := do(srv, inviteForm(srv, form))
+		if users, _ := store.List(); len(users) != 1 {
+			t.Fatalf("%s: user was created (status %d)", name, rec.Code)
+		}
+	}
+	if len(stub.provisioned) != 0 {
+		t.Error("provisioner called for a rejected invite")
+	}
+}
+
+func TestInviteRequiresValidCSRF(t *testing.T) {
+	srv, _, store := newTestServer(t)
+	rec := do(srv, inviteForm(srv, url.Values{
+		"email":       {"x@example.org"},
+		"displayname": {"X"},
+		"groups":      {"planka-users"},
+		"csrf":        {"1.bogus"},
+	}))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("bad csrf: got %d, want 403", rec.Code)
+	}
+	if users, _ := store.List(); len(users) != 1 {
+		t.Error("user created despite bad CSRF token")
+	}
+}
+
+func TestProvisionerFailureIsNonFatal(t *testing.T) {
+	srv, stub, store := newTestServer(t)
+	stub.failNext = true
+	rec := do(srv, inviteForm(srv, url.Values{
+		"email":       {"dave@example.org"},
+		"displayname": {"Dave"},
+		"groups":      {"planka-users"},
+	}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "not fatal") {
+		t.Error("warning not surfaced to the admin")
+	}
+	if _, err := store.Get("dave"); err != nil {
+		t.Error("SSO user should exist even when app provisioning fails")
+	}
+}
+
+func TestDeleteFlow(t *testing.T) {
+	srv, stub, store := newTestServer(t)
+	form := url.Values{
+		"confirm": {"on"},
+		"csrf":    {csrfToken(srv.cfg.CSRFSecret, "admin@example.org", time.Now())},
+	}
+	req := httptest.NewRequest("POST", "/users/alice/delete", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := do(srv, asAdmin(req))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body.String())
+	}
+	if users, _ := store.List(); len(users) != 0 {
+		t.Error("alice still present after delete")
+	}
+	if len(stub.deprovisiond) != 1 || stub.deprovisiond[0].Email != "alice@example.org" {
+		t.Errorf("deprovision not called: %+v", stub.deprovisiond)
+	}
+}
+
+func TestDeleteRequiresConfirmation(t *testing.T) {
+	srv, _, store := newTestServer(t)
+	form := url.Values{"csrf": {csrfToken(srv.cfg.CSRFSecret, "admin@example.org", time.Now())}}
+	req := httptest.NewRequest("POST", "/users/alice/delete", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if rec := do(srv, asAdmin(req)); rec.Code != http.StatusBadRequest {
+		t.Errorf("got %d, want 400", rec.Code)
+	}
+	if users, _ := store.List(); len(users) != 1 {
+		t.Error("user deleted without confirmation")
+	}
+}
+
+func TestSetGroups(t *testing.T) {
+	srv, _, store := newTestServer(t)
+	form := url.Values{
+		"groups": {"planka-owners"},
+		"csrf":   {csrfToken(srv.cfg.CSRFSecret, "admin@example.org", time.Now())},
+	}
+	req := httptest.NewRequest("POST", "/users/alice/groups", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if rec := do(srv, asAdmin(req)); rec.Code != http.StatusSeeOther {
+		t.Fatalf("got %d", rec.Code)
+	}
+	u, _ := store.Get("alice")
+	if len(u.Groups) != 1 || u.Groups[0] != "planka-owners" {
+		t.Errorf("groups not updated: %v", u.Groups)
+	}
+}

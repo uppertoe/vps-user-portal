@@ -1,0 +1,23 @@
+{{template "head" .}}
+<h1>Invite a user</h1>
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+<p class="muted">Creates the account everywhere at once. The user gets an email
+asking them to set their own password — nothing works until they do.</p>
+<form class="stack" method="post" action="/invite">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label for="email">Email <span class="hint">(allowed: {{range $i, $d := .Domains}}{{if $i}}, {{end}}@{{$d}}{{end}})</span></label>
+  <input type="email" id="email" name="email" required value="{{.Email}}">
+  <label for="displayname">Display name</label>
+  <input type="text" id="displayname" name="displayname" required value="{{.DisplayName}}">
+  <label for="username">Username <span class="hint">(optional — derived from the email if left blank)</span></label>
+  <input type="text" id="username" name="username" value="{{.Username}}">
+  <label>Groups</label>
+  <div class="checks">
+    {{$sel := .Selected}}
+    {{range .Groups}}
+    <label><input type="checkbox" name="groups" value="{{.}}"{{if index $sel .}} checked{{end}}> {{.}}</label>
+    {{end}}
+  </div>
+  <button type="submit">Create user</button>
+</form>
+{{template "foot" .}}

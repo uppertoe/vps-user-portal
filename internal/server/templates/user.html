@@ -1,0 +1,37 @@
+{{template "head" .}}
+<h1>{{.U.DisplayName}} <span class="muted">({{.U.Username}})</span></h1>
+<p>{{.U.Email}}</p>
+{{if .Apps}}
+<table>
+  <tr><th>App</th><th>Status</th></tr>
+  {{range $name, $st := .Apps}}
+  <tr><td>{{$name}}</td>
+      <td>{{if not $st.Present}}<span class="muted">not present (created at first login)</span>{{else if $st.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{$st.Role}}</span>{{end}}</td></tr>
+  {{end}}
+</table>
+{{end}}
+
+<form class="stack" method="post" action="/users/{{.U.Username}}/groups">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>Groups <span class="hint">(app roles follow at the user's next login)</span></label>
+  <div class="checks">
+    {{$sel := .Selected}}
+    {{range .Groups}}
+    <label><input type="checkbox" name="groups" value="{{.}}"{{if index $sel .}} checked{{end}}> {{.}}</label>
+    {{end}}
+  </div>
+  <button type="submit">Save groups</button>
+</form>
+
+<section class="danger-zone">
+  <h2>Remove user</h2>
+  <p class="muted">Removes SSO access immediately (sessions lapse within the
+  hour) and deactivates the user in connected apps. Their history and card
+  assignments are kept.</p>
+  <form method="post" action="/users/{{.U.Username}}/delete">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label><input type="checkbox" name="confirm"> Yes, remove {{.U.Email}}</label><br>
+    <button type="submit" class="danger">Remove user</button>
+  </form>
+</section>
+{{template "foot" .}}

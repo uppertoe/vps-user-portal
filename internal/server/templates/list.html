@@ -1,0 +1,24 @@
+{{template "head" .}}
+<h1>Users</h1>
+{{range .Warnings}}<div class="warning">{{.}}</div>{{end}}
+<table>
+  <tr>
+    <th>User</th><th>Email</th><th>Groups</th>
+    {{range .Apps}}<th>{{.}}</th>{{end}}
+  </tr>
+  {{range .Rows}}
+  <tr>
+    <td><a href="/users/{{.Username}}">{{.DisplayName}}</a><br><span class="muted">{{.Username}}</span></td>
+    <td>{{.Email}}</td>
+    <td>{{range .Groups}}<span class="tag">{{.}}</span>{{end}}</td>
+    {{$apps := .Apps}}
+    {{range $.Apps}}
+      {{$st := index $apps .}}
+      <td>{{if not $st.Present}}<span class="muted">&mdash;</span>{{else if $st.Deactivated}}<span class="danger">deactivated</span>{{else}}<span class="ok">{{$st.Role}}</span>{{end}}</td>
+    {{end}}
+  </tr>
+  {{else}}
+  <tr><td colspan="9" class="muted">No users yet — <a href="/invite">invite the first one</a>.</td></tr>
+  {{end}}
+</table>
+{{template "foot" .}}

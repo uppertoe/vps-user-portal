@@ -1,0 +1,49 @@
+# Worked example for a server repo: apps/invite/docker-compose.yml
+# (vps-base-template estate layout; adjust paths if yours differs).
+services:
+  invite:
+    # Pin by digest in your server repo (Renovate's pinDigests does this).
+    image: ghcr.io/uppertoe/vps-user-portal:latest
+    restart: unless-stopped
+    # Runs as the users-file owner (uid 1000 = deploy in the estate layout) so
+    # it can write the shared Authelia users directory.
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 128m
+    pids_limit: 128
+    env_file:
+      - path: ./.env
+        required: false # keep `docker compose config` valid in CI without a real .env
+    environment:
+      - DOMAIN=${DOMAIN}
+      - SSO_URL=https://sso.${DOMAIN}
+      - USERS_FILE=/authelia-users/users_database.yml
+      - PROVISIONERS_FILE=/config/provisioners.yaml
+    volumes:
+      # The Authelia users DIRECTORY (shared rw with the authelia container;
+      # single-file mounts break atomic-rename hot reload — see README).
+      - ../authelia/users:/authelia-users
+      - ./provisioners.yaml:/config/provisioners.yaml:ro
+    # Proxy-network wiring is generated (.generated/caddy/networks.yml): the
+    # portal joins its own invite_proxy network, which Caddy also joins.
+    # planka_internal grants access to planka-db ONLY (the invite role's
+    # grants are the real boundary); Caddy is not on that network.
+    networks:
+      - planka_internal
+    healthcheck:
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  planka_internal:
+    # Defined by apps/planka; referenced here so the portal can reach planka-db.
+    external: false

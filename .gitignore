@@ -1,0 +1,6 @@
+.env
+*.env
+!*.env.example
+!deploy/.env.example
+/portal
+/tmp/

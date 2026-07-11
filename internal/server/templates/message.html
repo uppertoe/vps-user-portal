@@ -1,0 +1,8 @@
+{{template "head" .}}
+<h1>{{.Title}}</h1>
+{{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+{{if .Message}}<p>{{.Message}}</p>{{end}}
+{{range .Warnings}}<div class="warning">{{.}}</div>{{end}}
+{{if .Note}}<div class="notice">{{.Note}}</div>{{end}}
+<p><a href="/">Back to the user list</a></p>
+{{template "foot" .}}

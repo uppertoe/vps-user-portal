@@ -1,0 +1,11 @@
+# apps/invite/provisioners.yaml -- which downstream apps get users
+# pre-created at invite time (and deactivated at offboarding).
+provisioners:
+  - type: planka-postgres
+    name: planka
+    dsn_env: PLANKA_DSN
+    # SSO group -> Planka role, in privilege order (first match wins).
+    roles:
+      planka-admins: admin
+      planka-owners: projectOwner
+      planka-users: boardUser
