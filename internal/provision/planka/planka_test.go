@@ -54,6 +54,19 @@ func TestRoleMappingPrivilegeOrder(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidRole(t *testing.T) {
+	t.Setenv("TEST_PLANKA_DSN", "postgres://x")
+	path := filepath.Join(t.TempDir(), "provisioners.yaml")
+	// "Admin" (wrong case) is not a valid Planka role; must be refused at load.
+	yml := "provisioners:\n  - type: planka-postgres\n    dsn_env: TEST_PLANKA_DSN\n    roles:\n      planka-admins: Admin\n"
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provision.Load(path); err == nil {
+		t.Error("invalid Planka role accepted")
+	}
+}
+
 func TestLoadRejectsBadConfig(t *testing.T) {
 	for name, yml := range map[string]string{
 		"unknown type": "provisioners:\n  - type: nonsense\n",

@@ -11,6 +11,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -91,6 +92,10 @@ func (s *Server) Handler() http.Handler {
 	return securityHeaders(mux)
 }
 
+// maxBodyBytes caps request bodies: the forms here are tiny, so a small limit
+// removes an unbounded-ParseForm memory-exhaustion vector on a small VPS.
+const maxBodyBytes = 64 << 10
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
@@ -99,6 +104,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cache-Control", "private, no-cache")
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -168,7 +174,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	err := s.checkErr
 	s.mu.RUnlock()
 	if err != nil {
-		http.Error(w, "provisioner check failing: "+err.Error(), http.StatusServiceUnavailable)
+		// /healthz is the one UNAUTHENTICATED endpoint. Keep the detail (which
+		// can carry the DB host/port/role from a pgx error) in the log only;
+		// the client gets a bare status.
+		slog.Warn("healthz reporting unhealthy", "err", err)
+		http.Error(w, "unhealthy", http.StatusServiceUnavailable)
 		return
 	}
 	fmt.Fprintln(w, "ok")
@@ -253,6 +263,18 @@ func (s *Server) handleInvite(w http.ResponseWriter, r *http.Request) {
 	// rows with no SSO user attached.
 	if err := s.store.Add(u, hash); err != nil {
 		s.audit.Event(adm.User, "invite", emailAddr, "groups="+strings.Join(groups, " "), err)
+		// Duplicate username/email are the common, expected mistakes and carry
+		// no sensitive detail (self-authored messages) — show them on the form.
+		// Anything else (e.g. a filesystem failure) goes through the generic
+		// s.fail path so host paths never reach the page.
+		if errors.Is(err, userstore.ErrDuplicate) {
+			s.render(w, r, "invite.html", map[string]any{
+				"Groups": s.cfg.Groups, "Domains": s.cfg.AllowedEmailDomains,
+				"Error": err.Error(),
+				"Email": emailAddr, "DisplayName": displayName, "Username": username, "Selected": toSet(groups),
+			})
+			return
+		}
 		s.fail(w, r, err)
 		return
 	}

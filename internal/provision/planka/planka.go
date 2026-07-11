@@ -46,6 +46,14 @@ type roleRule struct {
 	Role  string
 }
 
+// validPlankaRoles is Planka's user_account.role value set (from its model's
+// isIn validation; the DB column itself has no CHECK). The portal's roles:
+// mapping MUST also agree with the Planka deployment's OIDC_ADMIN_ROLES /
+// OIDC_PROJECT_OWNER_ROLES / OIDC_BOARD_USER_ROLES env: at first OIDC login
+// Planka re-derives role from the groups claim and overwrites the pre-seeded
+// value, so a mismatch silently demotes users after their first login.
+var validPlankaRoles = map[string]bool{"admin": true, "projectOwner": true, "boardUser": true}
+
 type Provisioner struct {
 	name string
 	pool *pgxpool.Pool
@@ -77,10 +85,19 @@ func newFromConfig(name string, cfg *yaml.Node) (*Provisioner, error) {
 	}
 	var rules []roleRule
 	for i := 0; i+1 < len(raw.Roles.Content); i += 2 {
-		rules = append(rules, roleRule{
-			Group: raw.Roles.Content[i].Value,
-			Role:  raw.Roles.Content[i+1].Value,
-		})
+		group := raw.Roles.Content[i].Value
+		role := raw.Roles.Content[i+1].Value
+		// user_account.role is plain text with no CHECK constraint — a typo
+		// like "Admin" or "board_user" would insert a user Planka treats as
+		// having no role. Reject unknown roles (and empty group/role from a
+		// non-scalar YAML value) at startup rather than minting broken users.
+		if group == "" || role == "" {
+			return nil, fmt.Errorf("planka-postgres: empty group or role in the roles mapping")
+		}
+		if !validPlankaRoles[role] {
+			return nil, fmt.Errorf("planka-postgres: %q is not a valid Planka role (want one of admin, projectOwner, boardUser)", role)
+		}
+		rules = append(rules, roleRule{Group: group, Role: role})
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
@@ -105,11 +122,33 @@ func (p *Provisioner) roleFor(groups []string) string {
 	return ""
 }
 
-// requiredColumns are the user_account columns this package touches, with
-// the properties it relies on.
-var requiredColumns = []string{"id", "email", "password", "role", "name", "username", "is_sso_user", "is_deactivated", "created_at"}
+// insertColumns is the set of user_account columns Provision writes. It is
+// the single source of truth for both the INSERT below and Check()'s
+// drift assertion: every NOT NULL column that lacks a database default MUST
+// appear here, or the insert fails at runtime. Planka sets its user-preference
+// columns in the application layer (Objection.js model defaults), NOT in the
+// database, so a raw insert has to supply them itself — verified against a
+// live `ghcr.io/plankanban/planka:latest` schema. The preference VALUES here
+// mirror Planka's own account-creation defaults, so an SSO-provisioned user is
+// indistinguishable from a UI-created one.
+//
+// id (bigint, default next_id()) and password (nullable, left NULL) are
+// deliberately omitted; created_at is nullable but set for cleanliness.
+var insertColumns = []string{
+	"email", "name", "username", "role", "is_sso_user", "is_deactivated",
+	"subscribe_to_own_cards", "subscribe_to_card_when_commenting",
+	"turn_off_recent_card_highlighting", "enable_favorites_by_default",
+	"default_editor_mode", "default_home_view", "default_projects_order",
+	"created_at",
+}
 
 func (p *Provisioner) Check(ctx context.Context) error {
+	// The drift guarantee: enumerate every column Postgres will REQUIRE on an
+	// insert (NOT NULL and no server-side default) and assert it is one we
+	// supply. If a future Planka version adds such a column, this fails —
+	// turning /healthz red — instead of letting the insert blow up per-user
+	// at provision time. Also confirms id keeps a default and password stays
+	// nullable (the two shape assumptions the insert relies on).
 	rows, err := p.pool.Query(ctx, `
 		SELECT column_name, is_nullable, column_default
 		FROM information_schema.columns
@@ -118,63 +157,108 @@ func (p *Provisioner) Check(ctx context.Context) error {
 		return fmt.Errorf("query user_account schema: %w", err)
 	}
 	defer rows.Close()
-	type col struct {
-		nullable   bool
-		hasDefault bool
+
+	provided := make(map[string]bool, len(insertColumns))
+	for _, c := range insertColumns {
+		provided[c] = true
 	}
-	cols := map[string]col{}
+	var (
+		found          int
+		idHasDefault   bool
+		passwordExists bool
+		passwordNull   bool
+		unmet          []string
+	)
 	for rows.Next() {
 		var name, nullable string
 		var def *string
 		if err := rows.Scan(&name, &nullable, &def); err != nil {
 			return err
 		}
-		cols[name] = col{nullable: nullable == "YES", hasDefault: def != nil}
+		found++
+		switch name {
+		case "id":
+			idHasDefault = def != nil
+		case "password":
+			passwordExists = true
+			passwordNull = nullable == "YES"
+		}
+		// A column the DB will demand but we don't write == certain insert failure.
+		if nullable == "NO" && def == nil && !provided[name] {
+			unmet = append(unmet, name)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(cols) == 0 {
+	if found == 0 {
 		return fmt.Errorf("user_account table not found — wrong database or Planka schema moved")
 	}
-	var missing []string
-	for _, c := range requiredColumns {
-		if _, ok := cols[c]; !ok {
-			missing = append(missing, c)
-		}
+	if len(unmet) > 0 {
+		return fmt.Errorf("user_account has required columns this provisioner does not set %v — Planka schema drift, refusing to provision", unmet)
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("user_account is missing expected columns %v — Planka schema drift, do not provision", missing)
-	}
-	if !cols["id"].hasDefault {
+	if !idHasDefault {
 		return fmt.Errorf("user_account.id has no default — this provisioner relies on Planka's id generator")
 	}
-	if !cols["password"].nullable {
-		return fmt.Errorf("user_account.password is NOT NULL — SSO-only rows need it nullable")
+	if !passwordExists || !passwordNull {
+		return fmt.Errorf("user_account.password is missing or NOT NULL — SSO-only rows need it nullable")
 	}
 	return nil
 }
+
+// Planka user-preference defaults (see insertColumns). Kept as named
+// constants so the intent — "match Planka's own new-account defaults" — is
+// explicit and one-line auditable against the app's model.
+const (
+	prefSubscribeToOwnCards      = false
+	prefSubscribeWhenCommenting  = true
+	prefTurnOffRecentHighlight   = false
+	prefEnableFavoritesByDefault = true
+	prefDefaultEditorMode        = "wysiwyg"
+	prefDefaultHomeView          = "groupedProjects"
+	prefDefaultProjectsOrder     = "byDefault"
+)
 
 func (p *Provisioner) Provision(ctx context.Context, u provision.User) error {
 	role := p.roleFor(u.Groups)
 	if role == "" {
 		return nil // no mapped group: this app is out of scope for the user
 	}
+	// Planka stores and looks up email lowercased, and the portal lowercases at
+	// intake, so an exact match is both correct and able to use the unique
+	// index (a lower(email) predicate would seq-scan and could also match a
+	// legacy mixed-case row Planka itself would treat as distinct).
 	email := strings.ToLower(u.Email)
+	// The unique constraint on email is the real guard against duplicates;
+	// this pre-check just yields a friendlier message. ON CONFLICT DO NOTHING
+	// closes the check-then-insert race: a concurrent invite that slips
+	// between the check and the insert affects 0 rows rather than erroring.
 	var exists bool
 	if err := p.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM user_account WHERE lower(email) = $1)`, email).Scan(&exists); err != nil {
+		`SELECT EXISTS (SELECT 1 FROM user_account WHERE email = $1)`, email).Scan(&exists); err != nil {
 		return fmt.Errorf("check existing user: %w", err)
 	}
 	if exists {
 		return fmt.Errorf("a Planka user with email %s already exists", email)
 	}
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO user_account (email, name, username, role, is_sso_user, is_deactivated, created_at)
-		VALUES ($1, $2, $3, $4, true, false, now())`,
-		email, u.DisplayName, u.Username, role)
+	tag, err := p.pool.Exec(ctx, `
+		INSERT INTO user_account
+			(email, name, username, role, is_sso_user, is_deactivated,
+			 subscribe_to_own_cards, subscribe_to_card_when_commenting,
+			 turn_off_recent_card_highlighting, enable_favorites_by_default,
+			 default_editor_mode, default_home_view, default_projects_order,
+			 created_at)
+		VALUES ($1, $2, $3, $4, true, false, $5, $6, $7, $8, $9, $10, $11, now())
+		ON CONFLICT (email) DO NOTHING`,
+		email, u.DisplayName, u.Username, role,
+		prefSubscribeToOwnCards, prefSubscribeWhenCommenting,
+		prefTurnOffRecentHighlight, prefEnableFavoritesByDefault,
+		prefDefaultEditorMode, prefDefaultHomeView, prefDefaultProjectsOrder)
 	if err != nil {
 		return fmt.Errorf("insert user_account row: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("a Planka user with email %s already exists", email)
 	}
 	return nil
 }

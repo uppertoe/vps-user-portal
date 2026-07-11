@@ -32,10 +32,18 @@ services:
       - ./provisioners.yaml:/config/provisioners.yaml:ro
     # Proxy-network wiring is generated (.generated/caddy/networks.yml): the
     # portal joins its own invite_proxy network, which Caddy also joins.
-    # planka_internal grants access to planka-db ONLY (the invite role's
-    # grants are the real boundary); Caddy is not on that network.
+    #
+    # For DB access the portal joins a DEDICATED invite_db network that ONLY
+    # planka-db also joins — NOT planka_internal. This matters: the portal
+    # trusts Caddy-injected Remote-User/Remote-Groups headers, which is safe
+    # only while Caddy is the sole route to it. If the portal shared
+    # planka_internal, the Planka APP container (the least-hardened service on
+    # the box) could reach http://invite:8080/ directly with a forged
+    # `Remote-Groups: admin` and seize the SSO user store. A dedicated db-only
+    # network removes that path entirely: the portal reaches Postgres, and
+    # neither portal<->planka-app direction exists. See README "Trust model".
     networks:
-      - planka_internal
+      - invite_db
     healthcheck:
       test: ["CMD", "/app", "-healthcheck"]
       interval: 15s
@@ -43,7 +51,11 @@ services:
       retries: 3
       start_period: 10s
 
+# A dedicated app<->db network for the portal. In the server repo you also add
+# `invite_db` to the `planka-db` service's networks list in
+# apps/planka/docker-compose.yml (planka-db then sits on planka_internal AND
+# invite_db; the Planka APP stays on planka_internal only). planka-db publishes
+# no ports and the `invite` Postgres role is INSERT/limited-UPDATE only, so this
+# network's blast radius is one narrowly-scoped DB role.
 networks:
-  planka_internal:
-    # Defined by apps/planka; referenced here so the portal can reach planka-db.
-    external: false
+  invite_db: {}

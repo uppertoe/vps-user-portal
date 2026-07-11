@@ -22,10 +22,12 @@
 package userstore
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -33,6 +35,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// ErrDuplicate is returned by Add when the username or email already exists.
+// Callers can errors.Is() this to show a friendly message (the wrapped text
+// is self-authored and safe to display) rather than a generic failure.
+var ErrDuplicate = errors.New("duplicate user")
 
 // User is the portal's view of one users_database.yml entry. Unknown fields
 // in the file are preserved by the node-tree editing but are not surfaced.
@@ -109,11 +116,15 @@ func (s *Store) Add(u User, passwordHash string) error {
 	return s.mutate(func(users *yaml.Node) error {
 		for i := 0; i+1 < len(users.Content); i += 2 {
 			existing := decodeUser(users.Content[i].Value, users.Content[i+1])
-			if existing.Username == u.Username {
-				return fmt.Errorf("username %q already exists", u.Username)
+			// Username compared case-insensitively to match Authelia's
+			// case_insensitive search: a lowercase twin of an existing
+			// mixed-case name would otherwise pass here and produce a file
+			// Authelia refuses to load.
+			if strings.EqualFold(existing.Username, u.Username) {
+				return fmt.Errorf("%w: username %q already exists", ErrDuplicate, u.Username)
 			}
 			if strings.EqualFold(existing.Email, u.Email) {
-				return fmt.Errorf("email %q already belongs to user %q", u.Email, existing.Username)
+				return fmt.Errorf("%w: email %q already belongs to user %q", ErrDuplicate, u.Email, existing.Username)
 			}
 		}
 		key := scalarNode(u.Username)
@@ -201,6 +212,14 @@ func (s *Store) Delete(username string) error {
 // output and runs verify(before, after) on semantic snapshots. Only if verify
 // passes is the file (atomically) replaced; the prior content is kept at
 // <path>.bak.
+//
+// Authelia writes this same file (in-place, WITHOUT a lock) when a user
+// completes a self-service password reset, so the flock only serialises
+// portal writers. To avoid clobbering such a write, each attempt re-reads the
+// file immediately before the rename and, if it changed since we read it,
+// restarts from the fresh content (bounded retries). This shrinks the
+// lost-update / torn-read window from the whole parse+encode duration to the
+// few microseconds between the final read and the rename.
 func (s *Store) mutate(edit func(users *yaml.Node) error, verify func(before, after map[string]map[string]any) error) error {
 	dir := filepath.Dir(s.Path)
 
@@ -214,34 +233,55 @@ func (s *Store) mutate(edit func(users *yaml.Node) error, verify func(before, af
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) //nolint:errcheck
 
+	sweepStaleTemps(dir)
+
+	const attempts = 4
+	for attempt := 0; ; attempt++ {
+		retry, err := s.mutateOnce(dir, edit, verify)
+		if err != nil {
+			return err
+		}
+		if !retry {
+			return nil
+		}
+		if attempt+1 >= attempts {
+			return fmt.Errorf("users file kept changing underneath us (concurrent writer?); retries exhausted")
+		}
+	}
+}
+
+// mutateOnce performs one attempt. It returns retry=true (err=nil) when the
+// file changed between our read and the rename, signalling the caller to try
+// again with fresh content.
+func (s *Store) mutateOnce(dir string, edit func(users *yaml.Node) error, verify func(before, after map[string]map[string]any) error) (retry bool, err error) {
 	original, err := os.ReadFile(s.Path)
 	if err != nil {
-		return fmt.Errorf("read users file: %w", err)
+		return false, fmt.Errorf("read users file: %w", err)
 	}
 	doc, err := parseBytes(original)
 	if err != nil {
-		return err
+		return false, err
 	}
 	before, err := snapshot(doc)
 	if err != nil {
-		return err
+		return false, err
 	}
 	users, err := usersMap(doc)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := edit(users); err != nil {
-		return err
+		return false, err
 	}
 
 	var sb strings.Builder
 	enc := yaml.NewEncoder(&sb)
 	enc.SetIndent(2)
 	if err := enc.Encode(doc.Content[0]); err != nil {
-		return fmt.Errorf("encode users file: %w", err)
+		return false, fmt.Errorf("encode users file: %w", err)
 	}
 	if err := enc.Close(); err != nil {
-		return fmt.Errorf("encode users file: %w", err)
+		return false, fmt.Errorf("encode users file: %w", err)
 	}
 	out := []byte(sb.String())
 
@@ -249,56 +289,89 @@ func (s *Store) mutate(edit func(users *yaml.Node) error, verify func(before, af
 	// happened before we touch the real file.
 	reparsed, err := parseBytes(out)
 	if err != nil {
-		return fmt.Errorf("output failed to re-parse (bug): %w", err)
+		return false, fmt.Errorf("output failed to re-parse (bug): %w", err)
 	}
 	after, err := snapshot(reparsed)
 	if err != nil {
-		return fmt.Errorf("output snapshot (bug): %w", err)
+		return false, fmt.Errorf("output snapshot (bug): %w", err)
 	}
 	if err := verify(before, after); err != nil {
-		return fmt.Errorf("post-write verification refused the change: %w", err)
+		return false, fmt.Errorf("post-write verification refused the change: %w", err)
+	}
+
+	// Guard against a concurrent (unlocked) Authelia write: if the file no
+	// longer matches what we read and edited, discard this attempt and retry.
+	if current, err := os.ReadFile(s.Path); err != nil {
+		return false, fmt.Errorf("re-read users file: %w", err)
+	} else if !bytes.Equal(current, original) {
+		return true, nil
 	}
 
 	if err := os.WriteFile(s.Path+".bak", original, 0o600); err != nil {
-		return fmt.Errorf("write backup: %w", err)
+		return false, fmt.Errorf("write backup: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".users_database.yml.tmp*")
 	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+		return false, fmt.Errorf("create temp file: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) //nolint:errcheck // no-op after successful rename
-	if err := tmp.Chmod(0o600); err != nil {
+	if _, err := tmp.Write(out); err != nil { // CreateTemp already makes it 0600
 		tmp.Close()
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	if _, err := tmp.Write(out); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write temp file: %w", err)
+		return false, fmt.Errorf("write temp file: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return fmt.Errorf("fsync temp file: %w", err)
+		return false, fmt.Errorf("fsync temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
+		return false, fmt.Errorf("close temp file: %w", err)
 	}
 	// Atomic replace: readers (Authelia) see either the old or the new file,
 	// never a partial one. The rename raises the Create event Authelia's
 	// file watcher reloads on.
 	if err := os.Rename(tmpName, s.Path); err != nil {
-		return fmt.Errorf("rename into place: %w", err)
+		return false, fmt.Errorf("rename into place: %w", err)
 	}
-	return nil
+	// fsync the directory so the rename (a completed invite / offboard) is
+	// durable across power loss — the welcome email is sent after we return.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return false, nil
+}
+
+// sweepStaleTemps removes leftover temp files from a previous crash between
+// CreateTemp and rename. Their names never match Authelia's watch filter, so
+// they're harmless, but they shouldn't accumulate. Best-effort.
+func sweepStaleTemps(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".users_database.yml.tmp") {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 func parseBytes(b []byte) (*yaml.Node, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
 	var doc yaml.Node
-	if err := yaml.Unmarshal(b, &doc); err != nil {
+	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("parse users file: %w", err)
 	}
 	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
 		return nil, fmt.Errorf("users file is empty or not a YAML document")
+	}
+	// Refuse a multi-document file: yaml.Unmarshal silently keeps only the
+	// first document, so encoding back would delete the rest. An Authelia
+	// users file is always a single document; a second one means we're
+	// looking at something we don't understand — fail closed.
+	if err := dec.Decode(new(yaml.Node)); err != io.EOF {
+		return nil, fmt.Errorf("users file has more than one YAML document; refusing to edit")
 	}
 	return &doc, nil
 }
@@ -320,6 +393,15 @@ func usersMap(doc *yaml.Node) (*yaml.Node, error) {
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		if root.Content[i].Value == "users" {
 			m := root.Content[i+1]
+			// An empty file (`users:` with a null value) is a valid,
+			// user-less store — normalise it to an empty mapping in place so
+			// the first user can be added. Reject any other non-mapping.
+			if m.Kind == yaml.ScalarNode && (m.Tag == "!!null" || m.Value == "") {
+				m.Kind = yaml.MappingNode
+				m.Tag = "!!map"
+				m.Value = ""
+				return m, nil
+			}
 			if m.Kind != yaml.MappingNode {
 				return nil, fmt.Errorf("'users' is not a mapping")
 			}
@@ -411,7 +493,13 @@ func untouchedEqual(before, after map[string]map[string]any, exempt string) erro
 		if !ok {
 			return fmt.Errorf("user %q vanished during an unrelated change", name)
 		}
-		if !reflect.DeepEqual(before[name], got) {
+		// Compare canonically re-encoded YAML rather than reflect.DeepEqual:
+		// yaml.v3 sorts map keys deterministically, and this avoids
+		// DeepEqual's NaN != NaN quirk (a `.nan` in any field would otherwise
+		// make every user compare unequal and brick all mutations).
+		beforeBytes, err1 := yaml.Marshal(before[name])
+		afterBytes, err2 := yaml.Marshal(got)
+		if err1 != nil || err2 != nil || !bytes.Equal(beforeBytes, afterBytes) {
 			return fmt.Errorf("user %q was modified during an unrelated change", name)
 		}
 	}
