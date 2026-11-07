@@ -3,7 +3,7 @@
 services:
   users:
     # Pin by digest in your server repo (Renovate's pinDigests does this).
-    image: ghcr.io/uppertoe/vps-user-portal:latest@sha256:b63d6c91fdef96749eb3df5ff318773140c9b2bd0f8e9f6d54c239ad5d70929b
+    image: ghcr.io/uppertoe/vps-user-portal:latest@sha256:5b3216b5275cb0542b8fdc23ac1836a541282be8f33433460efb4313abb9db40
     restart: unless-stopped
     # Runs as the users-file owner (uid 1000 = deploy in the estate layout) so
     # it can write the shared Authelia users directory.
